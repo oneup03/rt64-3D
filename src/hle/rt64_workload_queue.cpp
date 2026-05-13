@@ -292,7 +292,8 @@ namespace RT64 {
     void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
         const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
         float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-        uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts)
+        uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts,
+        StereoEye stereoEye)
     {
 #   if ENABLE_HIGH_RESOLUTION_RENDERER
         std::scoped_lock<std::mutex> managerLock(ext.sharedResources->workloadMutex);
@@ -303,7 +304,9 @@ namespace RT64 {
         rendererCPUProfiler.start();
 
         const bool aspectRatioAdjustment = (abs(workloadConfig.aspectRatioScale - 1.0f) > 1e-6f);
-        const bool processProjections = aspectRatioAdjustment || prevFrame.matched|| curFrame.isDebuggerCameraEnabled(*this);
+        const auto stereoMode = ext.sharedResources->userConfig.stereoMode;
+        const bool stereoActive = (stereoMode != UserConfiguration::StereoMode::Off);
+        const bool processProjections = aspectRatioAdjustment || prevFrame.matched || curFrame.isDebuggerCameraEnabled(*this) || stereoActive;
         bool uploadProjections = false;
         if (processProjections) {
             ProjectionProcessor::ProcessParams projParams;
@@ -314,6 +317,14 @@ namespace RT64 {
             projParams.curFrameWeight = curFrameWeight;
             projParams.prevFrameWeight = prevFrameWeight;
             projParams.aspectRatioScale = workloadConfig.aspectRatioScale;
+            projParams.stereoMode = stereoMode;
+            projParams.stereoSeparation = ext.sharedResources->userConfig.stereoSeparation;
+            projParams.stereoConvergence = ext.sharedResources->userConfig.stereoConvergence;
+            projParams.stereoHudDepth = ext.sharedResources->userConfig.stereoHudDepth;
+            // Caller selects which eye this pass renders. The two-pass driver in
+            // renderThreadLoop runs this function twice with Left then Right when
+            // stereoMode != Off and snapshots each pass's output target.
+            projParams.stereoEye = stereoActive ? stereoEye : StereoEye::None;
             projectionProcessor.process(projParams);
             projectionProcessor.upload(projParams);
             uploadProjections = true;
@@ -639,6 +650,28 @@ namespace RT64 {
                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
+                    // Compute the per-eye NDC.x offset for texture rectangles
+                    // so HUD text / dialog text / score icons / item prints
+                    // shift consistently with the rest of the HUD when stereo
+                    // is on. Sign and magnitude match applyStereoHudShift's
+                    // orthographic path so screen-rect UI lands at the same
+                    // visible depth as ortho-projected UI.
+                    drawParams.stereoRectOffsetX = 0.0f;
+                    if ((stereoMode != UserConfiguration::StereoMode::Off) &&
+                        (stereoEye != StereoEye::None)) {
+                        const auto hudDepth = ext.sharedResources->userConfig.stereoHudDepth;
+                        if (hudDepth != 50) {
+                            const float centered = (static_cast<float>(hudDepth) - 50.0f) / 50.0f;
+                            constexpr float maxHudOffset = 0.04f;
+                            const float hudOffset = -centered * maxHudOffset;
+                            constexpr float perspectiveToOrthoScale = 2.75f;
+                            const float eyeSign = (stereoEye == StereoEye::Left) ? +1.0f : -1.0f;
+                            // Negation mirrors applyStereoHudShift's orthographic
+                            // branch so rectangles shift in the same direction
+                            // as everything else.
+                            drawParams.stereoRectOffsetX = -eyeSign * hudOffset * perspectiveToOrthoScale;
+                        }
+                    }
                     framebufferRenderer->addFramebuffer(drawParams);
                 }
                 
@@ -1118,7 +1151,48 @@ namespace RT64 {
 
                     int64_t renderTimeMicro = workloadTimer.elapsedMicroseconds();
                     threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
-                        interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
+                        interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed,
+                        StereoEye::Left);
+
+                    // Stereoscopic 3D second pass: re-render this interpolated frame with
+                    // the right-eye projection. Paired one-to-one with the left-eye target
+                    // so both eyes update at the same rate. Gated on !usingMSAA because
+                    // RT64's override-target redirection is itself gated that way.
+                    const auto stereoModeWl = ext.sharedResources->userConfig.stereoMode;
+                    const bool stereoActiveWl = (stereoModeWl != UserConfiguration::StereoMode::Off);
+                    if (stereoActiveWl && !usingMSAA && !workload.paused && !interpolationTargetKey.isEmpty()) {
+                        RenderTarget *rightOverride = nullptr;
+                        uint32_t rightModifier = 0;
+                        if (overrideTarget != nullptr) {
+                            // Left eye used interpolatedTargets[targetIndex - 1]; we
+                            // pair it with stereoRightInterpolatedTargets at the same
+                            // slot so the present queue can match them index-for-index.
+                            const uint32_t slot = targetIndex - 1;
+                            auto &slots = ext.sharedResources->stereoRightInterpolatedTargets;
+                            if (slots.size() <= slot) {
+                                slots.resize(slot + 1);
+                            }
+                            if (slots[slot] == nullptr) {
+                                slots[slot] = std::make_unique<RenderTarget>(interpolationTargetKey.address, Framebuffer::Type::Color, RenderMultisampling(), usesHDR);
+                            }
+                            rightOverride = slots[slot].get();
+                            rightModifier = 0x8000u + (slot + 1u);
+                        }
+                        else {
+                            // Left eye used the natural target (the first frame in the
+                            // non-MSAA interpolated path, or any frame when interpolation
+                            // is off). Right eye goes into the single stereoRightColorTarget.
+                            auto &single = ext.sharedResources->stereoRightColorTarget;
+                            if (single == nullptr) {
+                                single = std::make_unique<RenderTarget>(interpolationTargetKey.address, Framebuffer::Type::Color, RenderMultisampling(), usesHDR);
+                            }
+                            rightOverride = single.get();
+                            rightModifier = 0x8000u;
+                        }
+                        threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
+                            interpolationTargetKey, interpolationTargetFbPairIndex, rightOverride, rightModifier, velocityUploaderUsed, false /* extras already uploaded by left pass */, tileInterpolationUsed, lookAtInterpolationUsed,
+                            StereoEye::Right);
+                    }
 
                     // Add total time the frame took to render.
                     renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
@@ -1151,6 +1225,9 @@ namespace RT64 {
 
                     framesRendered++;
                 }
+
+                // (Right-eye stereo pass is now run inside the displayFrames loop above,
+                // paired one-to-one with each left-eye render so both eyes match rate.)
 
                 // Set the skipped parameter on the frame counter if the workload wasn't skipped but some of its frames were.
                 if (skippedFrames && !skipWorkloadNow) {

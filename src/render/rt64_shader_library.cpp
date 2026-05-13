@@ -46,6 +46,7 @@
 #include "shaders/TextureResolveSamples8XPS.hlsl.spirv.h"
 #include "shaders/VideoInterfacePSRegular.hlsl.spirv.h"
 #include "shaders/VideoInterfacePSPixel.hlsl.spirv.h"
+#include "shaders/StereoComposePS.hlsl.spirv.h"
 #include "shaders/FullScreenVS.hlsl.spirv.h"
 #include "shaders/Im3DVS.hlsl.spirv.h"
 #include "shaders/ComposePS.hlsl.spirv.h"
@@ -92,6 +93,7 @@
 #   include "shaders/TextureResolveSamples8XPS.hlsl.dxil.h"
 #   include "shaders/VideoInterfacePSRegular.hlsl.dxil.h"
 #   include "shaders/VideoInterfacePSPixel.hlsl.dxil.h"
+#   include "shaders/StereoComposePS.hlsl.dxil.h"
 #   include "shaders/FullScreenVS.hlsl.dxil.h"
 #   include "shaders/Im3DVS.hlsl.dxil.h"
 #   include "shaders/ComposePS.hlsl.dxil.h"
@@ -137,6 +139,7 @@
 #   include "shaders/TextureResolveSamples8XPS.hlsl.metal.h"
 #   include "shaders/VideoInterfacePSRegular.hlsl.metal.h"
 #   include "shaders/VideoInterfacePSPixel.hlsl.metal.h"
+#   include "shaders/StereoComposePS.hlsl.metal.h"
 #   include "shaders/FullScreenVS.hlsl.metal.h"
 #   include "shaders/Im3DVS.hlsl.metal.h"
 #   include "shaders/ComposePS.hlsl.metal.h"
@@ -147,6 +150,7 @@
 
 #include "shared/rt64_fb_common.h"
 #include "shared/rt64_fb_reinterpret.h"
+#include "shared/rt64_stereo_compose.h"
 #include "shared/rt64_texture_copy.h"
 #include "shared/rt64_video_interface.h"
 
@@ -618,6 +622,39 @@ namespace RT64 {
             pipelineDesc.pixelShader = pixelShader.get();
             pipelineDesc.pipelineLayout = videoInterfacePixel.pipelineLayout.get();
             videoInterfacePixel.pipeline = device->createGraphicsPipeline(pipelineDesc);
+        }
+
+        // Stereo composition. Wired in by the present queue when stereoMode != Off
+        // to pack left+right eye textures into Side-by-Side, Top-and-Bottom, or
+        // Row-Interlaced output for stereo-capable displays. Uses linear sampling
+        // since the eye textures are resolved color targets.
+        {
+            std::unique_ptr<RenderShader> stereoShader = device->createShader(CREATE_SHADER_INPUTS(StereoComposePSBlobDXIL, StereoComposePSBlobSPIRV, StereoComposePSBlobMSL, "PSMain", shaderFormat));
+
+            StereoComposeDescriptorSet stereoDescriptorSet(samplerLibrary.linear.borderBorder.get());
+            layoutBuilder.begin();
+            layoutBuilder.addPushConstant(0, 0, sizeof(interop::StereoComposeCB), RenderShaderStageFlag::PIXEL);
+            layoutBuilder.addDescriptorSet(stereoDescriptorSet);
+            layoutBuilder.end();
+            stereoCompose.pipelineLayout = layoutBuilder.create(device);
+            stereoComposeUIOverlay.pipelineLayout = layoutBuilder.create(device);
+
+            RenderGraphicsPipelineDesc pipelineDesc;
+            pipelineDesc.vertexShader = fullScreenVertexShader.get();
+            pipelineDesc.pixelShader = stereoShader.get();
+            pipelineDesc.renderTargetFormat[0] = RenderFormat::B8G8R8A8_UNORM;
+            pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+            pipelineDesc.renderTargetCount = 1;
+            pipelineDesc.pipelineLayout = stereoCompose.pipelineLayout.get();
+            stereoCompose.pipeline = device->createGraphicsPipeline(pipelineDesc);
+
+            // Same shader, alpha-blended so it can be used to overlay UI on the
+            // already-composed stereo image. Both eye slots get the same UI
+            // texture so the UI appears mirrored across each half of SbS/TaB
+            // (and on every scanline for Interlaced).
+            pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+            pipelineDesc.pipelineLayout = stereoComposeUIOverlay.pipelineLayout.get();
+            stereoComposeUIOverlay.pipeline = device->createGraphicsPipeline(pipelineDesc);
         }
     }
 

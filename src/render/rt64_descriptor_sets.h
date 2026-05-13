@@ -674,4 +674,22 @@ namespace RT64 {
             }
         }
     };
+
+    struct StereoComposeDescriptorSet : RenderDescriptorSetBase {
+        uint32_t gLeftEye;
+        uint32_t gRightEye;
+        uint32_t gSampler;
+
+        StereoComposeDescriptorSet(const RenderSampler *sampler, RenderDevice *device = nullptr) {
+            builder.begin();
+            gLeftEye = builder.addTexture(1);
+            gRightEye = builder.addTexture(2);
+            gSampler = builder.addImmutableSampler(3, &sampler);
+            builder.end();
+
+            if (device != nullptr) {
+                create(device);
+            }
+        }
+    };
 };
