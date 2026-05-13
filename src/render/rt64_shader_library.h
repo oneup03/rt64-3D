@@ -57,6 +57,11 @@ namespace RT64 {
         ShaderRecord videoInterfaceLinear;
         ShaderRecord videoInterfaceNearest;
         ShaderRecord videoInterfacePixel;
+        ShaderRecord stereoCompose;
+        // Same pixel shader as stereoCompose but with alpha blending instead of
+        // copy blending so it can be used to overlay UI content on top of the
+        // already-composed stereo world image.
+        ShaderRecord stereoComposeUIOverlay;
 
         ShaderLibrary(bool usesHDR, bool usesHardwareResolve);
         ~ShaderLibrary();

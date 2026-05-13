@@ -29,6 +29,10 @@ namespace RT64 {
         j["hardwareResolve"] = cfg.hardwareResolve;
         j["idleWorkActive"] = cfg.idleWorkActive;
         j["developerMode"] = cfg.developerMode;
+        j["stereoMode"] = cfg.stereoMode;
+        j["stereoSeparation"] = cfg.stereoSeparation;
+        j["stereoConvergence"] = cfg.stereoConvergence;
+        j["stereoHudDepth"] = cfg.stereoHudDepth;
     }
 
     void from_json(const json &j, UserConfiguration &cfg) {
@@ -52,6 +56,10 @@ namespace RT64 {
         cfg.hardwareResolve = j.value("hardwareResolve", defaultCfg.hardwareResolve);
         cfg.idleWorkActive = j.value("idleWorkActive", defaultCfg.idleWorkActive);
         cfg.developerMode = j.value("developerMode", defaultCfg.developerMode);
+        cfg.stereoMode = j.value("stereoMode", defaultCfg.stereoMode);
+        cfg.stereoSeparation = j.value("stereoSeparation", defaultCfg.stereoSeparation);
+        cfg.stereoConvergence = j.value("stereoConvergence", defaultCfg.stereoConvergence);
+        cfg.stereoHudDepth = j.value("stereoHudDepth", defaultCfg.stereoHudDepth);
     }
 
     template <typename T>
@@ -83,6 +91,10 @@ namespace RT64 {
         hardwareResolve = HardwareResolve::Automatic;
         idleWorkActive = true;
         developerMode = false;
+        stereoMode = StereoMode::Off;
+        stereoSeparation = 50;
+        stereoConvergence = 20;
+        stereoHudDepth = 35;
     }
 
     void UserConfiguration::validate() {
@@ -97,6 +109,10 @@ namespace RT64 {
         clampEnum<RefreshRate>(refreshRate);
         clampEnum<InternalColorFormat>(internalColorFormat);
         clampEnum<HardwareResolve>(hardwareResolve);
+        clampEnum<StereoMode>(stereoMode);
+        stereoSeparation = std::clamp<uint32_t>(stereoSeparation, 0, 100);
+        stereoConvergence = std::clamp<uint32_t>(stereoConvergence, 1, 100);
+        stereoHudDepth = std::clamp<uint32_t>(stereoHudDepth, 0, 100);
         resolutionMultiplier = std::clamp<double>(resolutionMultiplier, 0.0f, ResolutionMultiplierLimit);
         downsampleMultiplier = std::clamp<int>(downsampleMultiplier, 1, ResolutionMultiplierLimit);
         aspectTarget = std::clamp<double>(aspectTarget, 0.1f, 100.0f);

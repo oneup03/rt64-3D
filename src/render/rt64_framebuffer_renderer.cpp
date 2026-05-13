@@ -1656,6 +1656,11 @@ namespace RT64 {
                             triangles.screenScale = { viewportRect.width / framebuffer.viewport.width, viewportRect.height / framebuffer.viewport.height };
                             triangles.screenOffset.x = halfPixelOffset.x + ((viewportRect.x + viewportRect.width / 2.0f) - halfViewportSize.x) / halfViewportSize.x;
                             triangles.screenOffset.y = halfPixelOffset.y + (halfViewportSize.y - (viewportRect.y + viewportRect.height / 2.0f)) / halfViewportSize.y;
+                            // Apply the per-eye stereo offset for texture
+                            // rectangles. This makes screen-space text/UI
+                            // shift in lockstep with the rest of the HUD when
+                            // the HUD Depth slider is moved in stereo mode.
+                            triangles.screenOffset.x += p.stereoRectOffsetX;
 
                             if (p.postBlendNoise) {
                                 // Indicate if post blend dither noise should be applied.
@@ -1669,6 +1674,13 @@ namespace RT64 {
                         case Projection::Type::Triangle: {
                             instanceDrawCall.type = InstanceDrawCall::Type::RawTriangles;
                             triangles.indexStart = call.meshDesc.rawVertexStart;
+                            // Raw triangles are pre-transformed into screen space
+                            // (no matrix multiply happens in the vertex shader),
+                            // so to shift them per-eye we add the stereo offset
+                            // to screenOffset.x, the same way the Rectangle path
+                            // does. This catches sprites drawn via drawTris,
+                            // including BK's zoombox bubble sprite.
+                            triangles.screenOffset.x += p.stereoRectOffsetX;
                             break;
                         }
                         case Projection::Type::None:

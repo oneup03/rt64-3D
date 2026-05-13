@@ -147,6 +147,12 @@ namespace RT64 {
             bool postBlendNoise;
             bool postBlendNoiseNegative;
             uint32_t maxGameCall;
+            // Per-eye NDC.x offset for screen-space texture rectangles. Set by
+            // the workload's stereo pass so that texture rectangles (HUD text,
+            // dialog text, item prints, etc.) shift in lockstep with the rest
+            // of the HUD as the user moves the HUD Depth slider. Zero when
+            // stereo is off.
+            float stereoRectOffsetX = 0.0f;
         };
 
         FramebufferRenderer(RenderWorker *worker, bool rtSupport, UserConfiguration::GraphicsAPI graphicsAPI, const ShaderLibrary *shaderLibrary);

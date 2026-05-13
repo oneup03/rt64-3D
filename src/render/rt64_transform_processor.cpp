@@ -10,7 +10,7 @@
 
 namespace RT64 {
     // TransformProcessor
-    
+
     TransformProcessor::TransformProcessor() { }
 
     TransformProcessor::~TransformProcessor() { }
@@ -69,7 +69,7 @@ namespace RT64 {
             }
         }
     }
-    
+
     void TransformProcessor::upload(const ProcessParams &p) {
         uploads.clear();
 
