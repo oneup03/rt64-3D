@@ -52,6 +52,15 @@ namespace RT64 {
         std::vector<uint32_t> colorImageAddressVector;
         std::unordered_set<uint32_t> colorImageAddressSet;
         std::vector<std::unique_ptr<RenderTarget>> interpolatedColorTargets;
+        // Right-eye color target for two-pass stereoscopic rendering. Allocated
+        // lazily on the first stereo frame and reused across frames. Paired with
+        // the natural color target for the non-interpolated path (or for the
+        // first frame in the non-MSAA interpolated path, which also uses the
+        // natural target on the left).
+        std::unique_ptr<RenderTarget> stereoRightColorTarget;
+        // Parallel to interpolatedColorTargets — one right-eye target per
+        // interpolated left-eye frame so both eyes update at the same rate.
+        std::vector<std::unique_ptr<RenderTarget>> stereoRightInterpolatedTargets;
         InterpolatedFrameCounters interpolatedFrames[2];
         uint32_t interpolatedFramesIndex = 0;
         std::mutex interpolatedMutex;
@@ -95,6 +104,11 @@ namespace RT64 {
             interpolatedFrames[1].skipped = true;
             renderTargetManager.destroyAll();
             renderTargetManager.setMultisampling(multisampling);
+            // Clear the stereo right-eye targets. They hold GPU resources from
+            // before the multisampling change; the workload thread re-allocates
+            // them on the next stereo frame.
+            stereoRightColorTarget.reset();
+            stereoRightInterpolatedTargets.clear();
         }
 
 #   if RT_ENABLED

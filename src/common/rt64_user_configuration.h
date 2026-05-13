@@ -83,6 +83,18 @@ namespace RT64 {
             OptionCount
         };
 
+        enum class StereoMode {
+            Off,
+            SideBySide,
+            TopAndBottom,
+            RowInterlaced,
+            ColumnInterlaced,
+            Checkerboard,
+            Anaglyph,
+            LeiaSR,
+            OptionCount
+        };
+
         GraphicsAPI graphicsAPI;
         Resolution resolution;
         DisplayBuffering displayBuffering;
@@ -102,6 +114,14 @@ namespace RT64 {
         HardwareResolve hardwareResolve;
         bool idleWorkActive;
         bool developerMode;
+        StereoMode stereoMode;
+        // Slider value 0..100 set from the host application; converted to
+        // world-space units by the renderer.
+        uint32_t stereoSeparation;
+        uint32_t stereoConvergence;
+        // HUD/textbox depth slider. 50 = screen plane (mono). Below 50 the HUD
+        // is pushed behind the screen; above 50 it pops out toward the viewer.
+        uint32_t stereoHudDepth;
 
         UserConfiguration();
         void validate();
@@ -168,6 +188,17 @@ namespace RT64 {
         { UserConfiguration::HardwareResolve::Disabled, "Disabled" },
         { UserConfiguration::HardwareResolve::Enabled, "Enabled" },
         { UserConfiguration::HardwareResolve::Automatic, "Automatic" }
+    });
+
+    NLOHMANN_JSON_SERIALIZE_ENUM(UserConfiguration::StereoMode, {
+        { UserConfiguration::StereoMode::Off, "Off" },
+        { UserConfiguration::StereoMode::SideBySide, "SideBySide" },
+        { UserConfiguration::StereoMode::TopAndBottom, "TopAndBottom" },
+        { UserConfiguration::StereoMode::RowInterlaced, "RowInterlaced" },
+        { UserConfiguration::StereoMode::ColumnInterlaced, "ColumnInterlaced" },
+        { UserConfiguration::StereoMode::Checkerboard, "Checkerboard" },
+        { UserConfiguration::StereoMode::Anaglyph, "Anaglyph" },
+        { UserConfiguration::StereoMode::LeiaSR, "LeiaSR" }
     });
 
     struct ConfigurationJSON {
