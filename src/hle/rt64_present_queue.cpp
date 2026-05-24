@@ -9,6 +9,10 @@
 
 #include "rt64_workload_queue.h"
 
+#ifdef LEIASR_SUPPORTED
+#   include "contrib/plume/plume_d3d12.h"
+#endif
+
 namespace RT64 {
     // PresentQueue
 
@@ -87,6 +91,7 @@ namespace RT64 {
         this->ext = ext;
 
         viRenderer = std::make_unique<VIRenderer>();
+        stereoRenderer = std::make_unique<StereoRenderer>();
 
         presentThreadRunning = true;
         presentThread = new std::thread(&PresentQueue::threadLoop, this);
@@ -343,14 +348,286 @@ namespace RT64 {
                 commandList->setFramebuffer(swapChainFramebuffer);
                 commandList->clearColor();
 
+                // Tracks whether the LeiaSR weaver consumed the SbS intermediate
+                // and wrote the final image to the swap chain itself. Hoisted out
+                // of the inner stereo branch because the UI-overlay block below
+                // needs to know (UI was already composed into the weaved image,
+                // so don't run the post-weave SbS overlay again).
+                bool composedThroughWeaver = false;
+
                 if (renderParams.texture != nullptr) {
                     commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
-                    viRenderer->render(renderParams);
+
+                    // Branch on stereoMode. The mono path is unchanged. For stereo, we
+                    // pair the natural color target (Left eye) with stereoRightColorTarget
+                    // (Right eye, populated by the workload thread's second pass) and let
+                    // StereoCompose pack them into the requested layout. If the right-eye
+                    // target hasn't been populated yet (first stereo frame, or any frame
+                    // where the workload couldn't run the second pass), we fall back to
+                    // binding the left texture to both slots.
+                    const auto stereoMode = ext.sharedResources->userConfig.stereoMode;
+                    if (stereoMode != UserConfiguration::StereoMode::Off) {
+                        RenderTexture *rightTexture = renderParams.texture;
+                        uint32_t rightTextureWidth = renderParams.textureWidth;
+                        uint32_t rightTextureHeight = renderParams.textureHeight;
+                        // Pick the right-eye target that matches whatever left-eye color
+                        // target this present iteration is using: interpolatedTargets[i]
+                        // pairs with stereoRightInterpolatedTargets[i]; the natural
+                        // target pairs with stereoRightColorTarget.
+                        RenderTarget *rightTarget = nullptr;
+                        if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
+                            const uint32_t targetIndex = usingMSAA ? i : (i - 1);
+                            auto &rightSlots = ext.sharedResources->stereoRightInterpolatedTargets;
+                            if (targetIndex < rightSlots.size()) {
+                                rightTarget = rightSlots[targetIndex].get();
+                            }
+                        }
+                        else {
+                            rightTarget = ext.sharedResources->stereoRightColorTarget.get();
+                        }
+                        if (rightTarget != nullptr) {
+                            const bool useRightDownsampling = (rightTarget->downsampleMultiplier > 1);
+                            if (useRightDownsampling) {
+                                rightTarget->downsampleTarget(ext.presentGraphicsWorker, ext.shaderLibrary);
+                                rightTexture = rightTarget->downsampledTexture.get();
+                                rightTextureWidth = rightTarget->width / rightTarget->downsampleMultiplier;
+                                rightTextureHeight = rightTarget->height / rightTarget->downsampleMultiplier;
+                            }
+                            else {
+                                rightTarget->resolveTarget(ext.presentGraphicsWorker, ext.shaderLibrary);
+                                rightTexture = rightTarget->getResolvedTexture();
+                                rightTextureWidth = rightTarget->width;
+                                rightTextureHeight = rightTarget->height;
+                            }
+                            commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(rightTexture, RenderTextureLayout::SHADER_READ));
+                        }
+
+                        StereoRenderer::RenderParams stereoParams;
+                        stereoParams.device = renderParams.device;
+                        stereoParams.commandList = renderParams.commandList;
+                        stereoParams.leftTexture = renderParams.texture;
+                        stereoParams.rightTexture = rightTexture;
+                        stereoParams.swapChain = renderParams.swapChain;
+                        stereoParams.shaderLibrary = renderParams.shaderLibrary;
+                        stereoParams.textureFormat = renderParams.textureFormat;
+                        stereoParams.resolutionScale = renderParams.resolutionScale;
+                        stereoParams.downsamplingScale = renderParams.downsamplingScale;
+                        stereoParams.textureWidth = renderParams.textureWidth;
+                        stereoParams.textureHeight = renderParams.textureHeight;
+                        stereoParams.stereoMode = stereoMode;
+                        stereoParams.vi = renderParams.vi;
+                        stereoParams.removeBlackBorders = renderParams.removeBlackBorders;
+                        // Always fill the full target for stereo: VIRenderer's
+                        // letterbox math would otherwise pillar/letterbox the
+                        // SbS/TaB image inside the swap chain, which breaks
+                        // full-SbS AR glasses (they need the whole frame),
+                        // 3D-TV row interlacing (rows must align with screen
+                        // scanlines), and the LeiaSR compose intermediate
+                        // (the weaver wants a packed-stereo input texture).
+                        // Run the game in fullscreen + auto resolution to get
+                        // the swap chain at the desktop's native size.
+                        stereoParams.fillFullTarget = true;
+
+                        // Forward the workload's aspectRatioScale so the
+                        // compose shader can crop each eye slot to the
+                        // content area of the eye texture. resolutionScale
+                        // is { multiplier * aspectRatioScale, multiplier },
+                        // so x/y recovers the original aspectRatioScale.
+                        // Defaults to 1 if resolution scale isn't available
+                        // yet (early frames), which makes the shader treat
+                        // the eye texture as fully filled.
+                        const auto resScale = ext.sharedResources->resolutionScale;
+                        const float resScaleX = static_cast<float>(resScale.x);
+                        const float resScaleY = static_cast<float>(resScale.y);
+                        stereoParams.aspectRatioScale = (resScaleY > 1e-6f) ? (resScaleX / resScaleY) : 1.0f;
+
+#                   ifdef LEIASR_SUPPORTED
+                        // LeiaSR weaving requires D3D12 and the SR Platform
+                        // service. When all of that is in place: compose SbS
+                        // into a desktop-resolution intermediate, then hand
+                        // that texture to the lenticular weaver which writes
+                        // to the swap chain instead of us. If anything's
+                        // missing we silently fall through to the regular
+                        // SbS-to-swap-chain compose below.
+                        if ((stereoMode == UserConfiguration::StereoMode::LeiaSR) &&
+                            (ext.createdGraphicsAPI == UserConfiguration::GraphicsAPI::D3D12) &&
+                            (ext.appWindow != nullptr) && (ext.appWindow->windowHandle != nullptr)) {
+                            // Attempt one-shot SDK init. Failure (SR Platform
+                            // service missing, etc.) sets leiaSRInitAttempted
+                            // so we don't keep retrying every frame.
+                            if (!leiaSRWeaver.isAvailable() && !leiaSRInitAttempted) {
+                                auto *d3dDevice = static_cast<plume::D3D12Device *>(ext.device);
+                                leiaSRWeaver.initialize(d3dDevice ? d3dDevice->d3d : nullptr, ext.appWindow->windowHandle);
+                                leiaSRInitAttempted = true;
+                            }
+
+                            if (leiaSRWeaver.isAvailable()) {
+                                const uint32_t perEyeW   = ext.swapChain->getWidth();
+                                const uint32_t perEyeH   = ext.swapChain->getHeight();
+                                const uint32_t sbsW      = perEyeW * 2u;
+                                const uint32_t sbsH      = perEyeH;
+                                if ((leiaSRComposeTexture == nullptr) || (leiaSRComposeWidth != sbsW) || (leiaSRComposeHeight != sbsH)) {
+                                    const RenderFormat composeFormat = RenderFormat::R8G8B8A8_UNORM;
+                                    RenderClearValue composeClear = RenderClearValue::Color(RenderColor(0.0f, 0.0f, 0.0f, 1.0f), composeFormat);
+                                    leiaSRComposeTexture = ext.device->createTexture(RenderTextureDesc::ColorTarget(sbsW, sbsH, composeFormat, RenderMultisampling(), &composeClear));
+                                    const RenderTexture *composeAttachment = leiaSRComposeTexture.get();
+                                    leiaSRComposeFramebuffer = ext.device->createFramebuffer(RenderFramebufferDesc(&composeAttachment, 1));
+                                    leiaSRComposeWidth  = sbsW;
+                                    leiaSRComposeHeight = sbsH;
+                                }
+
+                                // 1. Compose SbS-packed stereo into the 2*perEyeW × perEyeH intermediate.
+                                commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(leiaSRComposeTexture.get(), RenderTextureLayout::COLOR_WRITE));
+                                commandList->setFramebuffer(leiaSRComposeFramebuffer.get());
+                                commandList->clearColor();
+
+                                StereoRenderer::RenderParams composeParams = stereoParams;
+                                composeParams.stereoMode    = UserConfiguration::StereoMode::SideBySide;
+                                composeParams.targetWidth   = sbsW;
+                                composeParams.targetHeight  = sbsH;
+                                composeParams.fillFullTarget = true;
+                                stereoRenderer->render(composeParams);
+
+                                // 2. Composite the Configuration GUI into the SAME SbS intermediate
+                                //    BEFORE the weave so the weaver sees game + UI as a single SbS image.
+                                RenderHookDraw *leiaDrawHook = GetRenderHookDraw();
+                                if (leiaDrawHook != nullptr) {
+                                    const uint32_t uiWidth  = perEyeW;
+                                    const uint32_t uiHeight = perEyeH;
+                                    if ((stereoUITexture == nullptr) || (stereoUITextureWidth != uiWidth) || (stereoUITextureHeight != uiHeight)) {
+                                        RenderClearValue uiClear = RenderClearValue::Color(RenderColor(0.0f, 0.0f, 0.0f, 0.0f), RenderFormat::B8G8R8A8_UNORM);
+                                        stereoUITexture = ext.device->createTexture(RenderTextureDesc::ColorTarget(uiWidth, uiHeight, RenderFormat::B8G8R8A8_UNORM, RenderMultisampling(), &uiClear));
+                                        const RenderTexture *uiColorAttachment = stereoUITexture.get();
+                                        stereoUIFramebuffer = ext.device->createFramebuffer(RenderFramebufferDesc(&uiColorAttachment, 1));
+                                        stereoUITextureWidth = uiWidth;
+                                        stereoUITextureHeight = uiHeight;
+                                    }
+
+                                    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(stereoUITexture.get(), RenderTextureLayout::COLOR_WRITE));
+                                    commandList->setFramebuffer(stereoUIFramebuffer.get());
+                                    commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 0.0f));
+                                    leiaDrawHook(commandList, stereoUIFramebuffer.get());
+
+                                    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(stereoUITexture.get(), RenderTextureLayout::SHADER_READ));
+                                    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(leiaSRComposeTexture.get(), RenderTextureLayout::COLOR_WRITE));
+                                    commandList->setFramebuffer(leiaSRComposeFramebuffer.get());
+
+                                    StereoRenderer::RenderParams uiOverlayParams = composeParams;
+                                    uiOverlayParams.leftTexture = stereoUITexture.get();
+                                    uiOverlayParams.rightTexture = stereoUITexture.get();
+                                    uiOverlayParams.textureFormat = RenderFormat::B8G8R8A8_UNORM;
+                                    uiOverlayParams.resolutionScale = { 1.0f, 1.0f };
+                                    uiOverlayParams.downsamplingScale = 1;
+                                    uiOverlayParams.textureWidth = uiWidth;
+                                    uiOverlayParams.textureHeight = uiHeight;
+                                    uiOverlayParams.aspectRatioScale = 1.0f;
+                                    uiOverlayParams.isUIOverlay = true;
+                                    stereoRenderer->render(uiOverlayParams);
+                                }
+
+                                // 3. Transition intermediate to SHADER_READ and rebind swap chain.
+                                commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(leiaSRComposeTexture.get(), RenderTextureLayout::SHADER_READ));
+                                commandList->setFramebuffer(swapChainFramebuffer);
+
+                                // 3.5. Reset the rasterizer viewport/scissor to swap-chain dims so
+                                //      the weaver renders into the swap chain instead of inheriting
+                                //      the previous sbsW × sbsH compose viewport.
+                                commandList->setViewports(RenderViewport(0.0f, 0.0f, float(ext.swapChain->getWidth()), float(ext.swapChain->getHeight())));
+                                commandList->setScissors(RenderRect(0, 0, int32_t(ext.swapChain->getWidth()), int32_t(ext.swapChain->getHeight())));
+
+                                // 4. Hand off to the LeiaSR weaver.
+                                auto *d3dCommandList = static_cast<plume::D3D12CommandList *>(commandList);
+                                auto *d3dInputTexture = static_cast<plume::D3D12Texture *>(leiaSRComposeTexture.get());
+                                auto *d3dSwapChain = static_cast<plume::D3D12SwapChain *>(ext.swapChain);
+                                if (d3dCommandList && d3dInputTexture && d3dSwapChain) {
+                                    D3D12_VIEWPORT weaveViewport = {};
+                                    weaveViewport.Width = static_cast<float>(ext.swapChain->getWidth());
+                                    weaveViewport.Height = static_cast<float>(ext.swapChain->getHeight());
+                                    weaveViewport.MinDepth = 0.0f;
+                                    weaveViewport.MaxDepth = 1.0f;
+                                    D3D12_RECT weaveScissor = {};
+                                    weaveScissor.right = static_cast<LONG>(ext.swapChain->getWidth());
+                                    weaveScissor.bottom = static_cast<LONG>(ext.swapChain->getHeight());
+                                    leiaSRWeaver.weave(d3dInputTexture->d3d,
+                                        static_cast<int>(sbsW), static_cast<int>(sbsH),
+                                        DXGI_FORMAT_R8G8B8A8_UNORM, d3dSwapChain->nativeFormat,
+                                        d3dCommandList->d3d, weaveViewport, weaveScissor);
+                                    composedThroughWeaver = true;
+                                }
+                            }
+                        }
+#                   endif // LEIASR_SUPPORTED
+
+                        if (!composedThroughWeaver) {
+                            stereoRenderer->render(stereoParams);
+                        }
+                    }
+                    else {
+                        viRenderer->render(renderParams);
+                    }
                 }
 
                 RenderHookDraw *drawHook = GetRenderHookDraw();
                 if (drawHook != nullptr) {
-                    drawHook(commandList, swapChainFramebuffer);
+                    const auto stereoModeHook = ext.sharedResources->userConfig.stereoMode;
+#               ifdef LEIASR_SUPPORTED
+                    // When the LeiaSR weaver handled the game compose, the UI
+                    // was already alpha-blended into the SbS intermediate and
+                    // weaved together. Drawing it again here would render
+                    // SbS-layout UI on top of the weaved image.
+                    const bool skipUIOverlay = composedThroughWeaver;
+#               else
+                    constexpr bool skipUIOverlay = false;
+#               endif
+                    if (skipUIOverlay) {
+                        // UI already composed via the weaver above.
+                    }
+                    else if (stereoModeHook != UserConfiguration::StereoMode::Off) {
+                        // Render the Configuration GUI into an off-screen texture
+                        // then alpha-blend it over the already-composed stereo
+                        // image, mirrored per eye. The off-screen target is sized
+                        // to the swap chain so the UI renders at its native scale.
+                        const uint32_t uiWidth = ext.swapChain->getWidth();
+                        const uint32_t uiHeight = ext.swapChain->getHeight();
+                        if ((stereoUITexture == nullptr) || (stereoUITextureWidth != uiWidth) || (stereoUITextureHeight != uiHeight)) {
+                            RenderClearValue uiClear = RenderClearValue::Color(RenderColor(0.0f, 0.0f, 0.0f, 0.0f), RenderFormat::B8G8R8A8_UNORM);
+                            stereoUITexture = ext.device->createTexture(RenderTextureDesc::ColorTarget(uiWidth, uiHeight, RenderFormat::B8G8R8A8_UNORM, RenderMultisampling(), &uiClear));
+                            const RenderTexture *uiColorAttachment = stereoUITexture.get();
+                            stereoUIFramebuffer = ext.device->createFramebuffer(RenderFramebufferDesc(&uiColorAttachment, 1));
+                            stereoUITextureWidth = uiWidth;
+                            stereoUITextureHeight = uiHeight;
+                        }
+
+                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(stereoUITexture.get(), RenderTextureLayout::COLOR_WRITE));
+                        commandList->setFramebuffer(stereoUIFramebuffer.get());
+                        commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 0.0f));
+
+                        drawHook(commandList, stereoUIFramebuffer.get());
+
+                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(stereoUITexture.get(), RenderTextureLayout::SHADER_READ));
+                        commandList->setFramebuffer(swapChainFramebuffer);
+
+                        StereoRenderer::RenderParams overlayParams;
+                        overlayParams.device = ext.device;
+                        overlayParams.commandList = commandList;
+                        overlayParams.leftTexture = stereoUITexture.get();
+                        overlayParams.rightTexture = stereoUITexture.get();
+                        overlayParams.swapChain = ext.swapChain;
+                        overlayParams.shaderLibrary = ext.shaderLibrary;
+                        overlayParams.textureFormat = RenderFormat::B8G8R8A8_UNORM;
+                        overlayParams.resolutionScale = { 1.0f, 1.0f };
+                        overlayParams.downsamplingScale = 1;
+                        overlayParams.textureWidth = uiWidth;
+                        overlayParams.textureHeight = uiHeight;
+                        overlayParams.stereoMode = stereoModeHook;
+                        overlayParams.vi = &present.screenVI;
+                        overlayParams.removeBlackBorders = removeBlackBorders;
+                        overlayParams.isUIOverlay = true;
+                        stereoRenderer->render(overlayParams);
+                    }
+                    else {
+                        drawHook(commandList, swapChainFramebuffer);
+                    }
                 }
 
                 {

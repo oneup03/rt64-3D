@@ -197,6 +197,12 @@ namespace RT64 {
         void forceUpscale2D(bool force);
         void forceTrueBilerp(uint8_t mode);
         void forceScaleLOD(bool force);
+        // Goemon64Recomp3D stereo-3D: tag the next drawn rectangle(s) as a
+        // background "skybox" so the stereo pipeline gives them maximum
+        // positive parallax instead of the HUD-depth shift. Cleared by
+        // setSkyboxRect(false) — the recomp patch wraps the background-draw
+        // dispatcher in matched on/off calls.
+        void setSkyboxRect(bool on);
         void clearExtended();
 
         // The expected size and order for the elements in each array are:

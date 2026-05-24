@@ -174,6 +174,11 @@ namespace RT64 {
             const uint8_t force = (*dl)->p1(0, 1);
             state->rdp->forceScaleLOD(force);
         }
+
+        void setSkyboxRectV1(State *state, DisplayList **dl) {
+            const uint8_t on = (*dl)->p1(0, 1);
+            state->rdp->setSkyboxRect(on != 0);
+        }
         
         void forceBranchV1(State *state, DisplayList **dl) {
             const uint8_t force = (*dl)->p1(0, 1);
@@ -399,6 +404,7 @@ namespace RT64 {
             Map[G_EX_FORCEUPSCALE2D_V1] = &forceUpscale2DV1;
             Map[G_EX_FORCETRUEBILERP_V1] = &forceTrueBilerpV1;
             Map[G_EX_FORCESCALELOD_V1] = &forceScaleLODV1;
+            Map[G_EX_SETSKYBOXRECT_V1] = &setSkyboxRectV1;
             Map[G_EX_FORCEBRANCH_V1] = &forceBranchV1;
             Map[G_EX_SETRENDERTORAM_V1] = &setRenderToRAMV1;
             Map[G_EX_EDITGROUPBYADDRESS_V1] = &editGroupByAddressV1;

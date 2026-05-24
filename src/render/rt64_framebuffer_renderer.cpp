@@ -1699,6 +1699,21 @@ namespace RT64 {
                             triangles.screenScale = { viewportRect.width / framebuffer.viewport.width, viewportRect.height / framebuffer.viewport.height };
                             triangles.screenOffset.x = halfPixelOffset.x + ((viewportRect.x + viewportRect.width / 2.0f) - halfViewportSize.x) / halfViewportSize.x;
                             triangles.screenOffset.y = halfPixelOffset.y + (halfViewportSize.y - (viewportRect.y + viewportRect.height / 2.0f)) / halfViewportSize.y;
+                            // Apply the per-eye stereo offset for texture
+                            // rectangles. Rects tagged via gEXSetSkyboxRect
+                            // (a per-draw extended flag) get the "infinity"
+                            // parallax (matches off-axis projection at far);
+                            // everything else gets the HUD-depth shift so
+                            // screen-space text/UI lands at the same visible
+                            // depth as ortho-projected UI. Texture rects
+                            // hardcode transformsIndex=0 in changeProjection,
+                            // so matrix-group tagging via G_MTX_PROJECTION
+                            // doesn't propagate to them — we use the per-rect
+                            // extendedFlags bit instead, which IS captured on
+                            // every drawCall via loadDrawState.
+                            triangles.screenOffset.x += call.callDesc.extendedFlags.skyboxRect
+                                ? p.stereoSkyboxRectOffsetX
+                                : p.stereoRectOffsetX;
 
                             if (p.postBlendNoise) {
                                 // Indicate if post blend dither noise should be applied.
@@ -1712,6 +1727,12 @@ namespace RT64 {
                         case Projection::Type::Triangle: {
                             instanceDrawCall.type = InstanceDrawCall::Type::RawTriangles;
                             triangles.indexStart = call.meshDesc.rawVertexStart;
+                            // Raw triangles are pre-transformed into screen space
+                            // (no matrix multiply happens in the vertex shader),
+                            // so to shift them per-eye we add the stereo offset
+                            // to screenOffset.x, the same way the Rectangle path
+                            // does. This catches sprites drawn via drawTris.
+                            triangles.screenOffset.x += p.stereoRectOffsetX;
                             break;
                         }
                         case Projection::Type::None:

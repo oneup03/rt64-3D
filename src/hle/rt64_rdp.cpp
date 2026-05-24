@@ -1078,6 +1078,11 @@ namespace RT64 {
         state->updateDrawStatusAttribute(DrawAttribute::ExtendedFlags);
     }
 
+    void RDP::setSkyboxRect(bool on) {
+        extended.drawExtendedFlags.skyboxRect = on;
+        state->updateDrawStatusAttribute(DrawAttribute::ExtendedFlags);
+    }
+
     void RDP::clearExtended() {
         extended.scissorLeftOriginStack[0] = G_EX_ORIGIN_NONE;
         extended.scissorRightOriginStack[0] = G_EX_ORIGIN_NONE;

@@ -65,6 +65,13 @@ namespace RT64 {
         uint32_t forceUpscale2D : 1;
         uint32_t forceTrueBilerp : 2;
         uint32_t forceScaleLOD : 1;
+        // Goemon64Recomp3D stereo-3D: when set, this draw is a 2D background
+        // ("skybox") rectangle that should receive maximum positive parallax
+        // (visually "at infinity") in stereo rendering instead of the HUD
+        // depth shift the framebuffer renderer applies to ordinary rects.
+        // Set by RDP::setSkyboxRect via the gEXSetSkyboxRect GBI command,
+        // emitted by the patch on Goemon's background-draw dispatcher.
+        uint32_t skyboxRect : 1;
     };
 
     struct DrawCall {
