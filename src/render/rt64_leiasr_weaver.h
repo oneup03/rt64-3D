@@ -13,16 +13,15 @@
 #include <dxgi.h>
 #include <memory>
 
-// Forward-declare so we don't pull the entire SDK into rt64's public surface.
-namespace SR {
-    class SRContext;
-    class IDX12Weaver1;
-}
-
 namespace RT64 {
-    // Thin wrapper around LeiaSR's SRContext + IDX12Weaver1. Owns the context
-    // and weaver, exposes a single weave() entry point that the present queue
-    // calls after composing the per-eye textures into a single SbS image.
+    // Thin wrapper around SR-lib's SimulatedReality::SRInterfaceDX12, which in
+    // turn owns the SDK's SRContext + IDX12Weaver1. Exposes a single weave()
+    // entry point that the present queue calls after composing the per-eye
+    // textures into a single SbS image.
+    //
+    // The SDK-facing details (context lifetime, weaver creation ordering,
+    // destroy-not-delete, the DX12 per-frame setter dance) live in SR-lib now,
+    // so this is only the rt64-shaped adapter around them.
     //
     // The SDK's runtime requires the SR Platform service installed on the
     // user's machine. If it's not present, initialize() returns false and the
@@ -62,9 +61,8 @@ namespace RT64 {
                    const D3D12_VIEWPORT &viewport, const D3D12_RECT &scissorRect);
 
     private:
-        // Hidden behind unique_ptrs of forward-declared SDK types so this
-        // header doesn't pull in sr/weaver/dx12weaver.h transitively. The
-        // .cpp owns the full SDK includes.
+        // Pimpl so this header doesn't pull in SR.hpp (and through it d3d9.h /
+        // d3d11_1.h) transitively. The .cpp owns that include.
         struct State;
         std::unique_ptr<State> state;
     };
