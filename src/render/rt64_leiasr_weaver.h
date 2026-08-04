@@ -45,18 +45,18 @@ namespace RT64 {
 
         // Configures the weaver for a single weave() call:
         //   - inputTexture: SbS-packed stereo image. Must be in SHADER_READ.
-        //   - inputWidth/Height: dimensions of inputTexture in pixels.
-        //   - inputFormat: DXGI format of inputTexture.
+        //     Its dimensions and format are read from the resource desc, so
+        //     they can't be described as something the allocation isn't.
         //   - outputFormat: DXGI format of the current render target.
         //   - commandList: command list to record weave commands into.
         //   - viewport / scissorRect: where on the bound render target to
         //     write. Typically full swap-chain extent.
         //
         // Records weaving commands into commandList. Caller is responsible for
-        // binding the destination render target and managing barriers around
-        // the call.
-        void weave(ID3D12Resource *inputTexture, int inputWidth, int inputHeight,
-                   DXGI_FORMAT inputFormat, DXGI_FORMAT outputFormat,
+        // binding the destination render target, managing barriers around the
+        // call, and having already set the command list's own rasterizer
+        // viewport/scissor to the destination extent.
+        void weave(ID3D12Resource *inputTexture, DXGI_FORMAT outputFormat,
                    ID3D12GraphicsCommandList *commandList,
                    const D3D12_VIEWPORT &viewport, const D3D12_RECT &scissorRect);
 

@@ -549,8 +549,7 @@ namespace RT64 {
                                     weaveScissor.right = static_cast<LONG>(ext.swapChain->getWidth());
                                     weaveScissor.bottom = static_cast<LONG>(ext.swapChain->getHeight());
                                     leiaSRWeaver.weave(d3dInputTexture->d3d,
-                                        static_cast<int>(sbsW), static_cast<int>(sbsH),
-                                        DXGI_FORMAT_R8G8B8A8_UNORM, d3dSwapChain->nativeFormat,
+                                        d3dSwapChain->nativeFormat,
                                         d3dCommandList->d3d, weaveViewport, weaveScissor);
                                     composedThroughWeaver = true;
                                 }
