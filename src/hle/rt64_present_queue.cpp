@@ -604,8 +604,7 @@ namespace RT64 {
                                     // the swap chain rather than rendering at 2*swapW with
                                     // only the left half visible.
                                     leiaSRWeaver.weave(d3dInputTexture->d3d,
-                                        static_cast<int>(sbsW), static_cast<int>(sbsH),
-                                        DXGI_FORMAT_R8G8B8A8_UNORM, d3dSwapChain->nativeFormat,
+                                        d3dSwapChain->nativeFormat,
                                         d3dCommandList->d3d, weaveViewport, weaveScissor);
                                     composedThroughWeaver = true;
                                 }
