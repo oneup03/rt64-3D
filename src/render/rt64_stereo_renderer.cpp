@@ -4,6 +4,8 @@
 
 #include "rt64_stereo_renderer.h"
 
+#include <algorithm>
+
 #include "shared/rt64_hlsl.h"
 #include "shared/rt64_stereo_compose.h"
 
@@ -70,15 +72,41 @@ namespace RT64 {
             pushConstants.textureResolution = { 1.0f, 1.0f };
             pushConstants.gamma = 1.0f;
         } else if (p.fillFullTarget) {
-            // Default fillFullTarget: sample the full eye texture across each
-            // SbS / TaB / Interlaced / LeiaSR-intermediate slot. The texture's
-            // content already covers the canvas (Expand mode widens the FoV
-            // to fill it), so each half gets the whole rendered view
-            // stretched/squished to fit — the "fills the half" behavior the
-            // user picked as the default.
+            // Stretch the eye texture's CONTENT across each SbS / TaB /
+            // Interlaced / LeiaSR-intermediate slot, so each half gets the whole
+            // rendered view — the "fills the half" behavior stereo wants.
+            //
+            // The content is not always the whole texture. RT64 grows colour
+            // targets but never shrinks them, so when the game drops to a smaller
+            // framebuffer the drawn region covers only a corner of a target still
+            // sized for the largest framebuffer seen. Dinosaur Planet does exactly
+            // this on its 2D option/legal screens, which otherwise render at
+            // roughly half size in the top-left of each eye.
+            //
+            // So derive the content extent from the VI, the same way the mono
+            // VIRenderer path does, rather than assuming texture == content. When
+            // the content genuinely does fill the target (the Expand-aspect
+            // gameplay case) this resolves to the full texture and is a no-op.
             const float texW = static_cast<float>(p.textureWidth ? p.textureWidth : 1);
             const float texH = static_cast<float>(p.textureHeight ? p.textureHeight : 1);
-            pushConstants.videoResolution = { texW, texH };
+
+            float contentW = texW;
+            float contentH = texH;
+            if (p.vi != nullptr) {
+                const hlslpp::float2 videoRes = (hlslpp::float2(p.vi->fbSize()) * p.resolutionScale) / float(p.downsamplingScale);
+                const float viW = static_cast<float>(videoRes.x);
+                const float viH = static_cast<float>(videoRes.y);
+                // Ignore a degenerate VI size rather than composing a blank or
+                // wildly zoomed frame from it; the full texture is the safe
+                // fallback. Clamp to the texture because sampling past the
+                // content rect would read undrawn texels.
+                if ((viW > 1.0f) && (viH > 1.0f)) {
+                    contentW = std::min(viW, texW);
+                    contentH = std::min(viH, texH);
+                }
+            }
+
+            pushConstants.videoResolution = { contentW, contentH };
             pushConstants.textureResolution = { texW, texH };
             pushConstants.contentOrigin = { 0.0f, 0.0f };
             pushConstants.gamma = p.vi ? p.vi->gamma() : 1.0f;
@@ -87,14 +115,19 @@ namespace RT64 {
             // ultrawide / 32:9 desktops, where full-SbS AR glasses split the
             // image into two 16:9 halves), crop each eye to its centered 16:9
             // slice so the glasses see correctly-proportioned content instead
-            // of a horizontally squashed view. On 16:9 displays texAspect is
-            // ~16:9 and this is a no-op.
-            const float texAspect = (texH > 0.0f) ? (texW / texH) : 1.0f;
+            // of a horizontally squashed view. On 16:9 displays the content
+            // aspect is ~16:9 and this is a no-op.
+            //
+            // Measured on the content rect, not the texture, or a partially
+            // filled target would be judged by the wrong aspect. contentOrigin
+            // is in normalized TEXTURE uv, so the centering offset divides by
+            // texW rather than contentW.
+            const float contentAspect = (contentH > 0.0f) ? (contentW / contentH) : 1.0f;
             constexpr float kTargetEyeAspect = 16.0f / 9.0f;
-            if (texAspect > kTargetEyeAspect + 1e-4f) {
-                const float contentFractionX = kTargetEyeAspect / texAspect;
-                pushConstants.videoResolution = { texW * contentFractionX, texH };
-                pushConstants.contentOrigin = { (1.0f - contentFractionX) * 0.5f, 0.0f };
+            if (contentAspect > kTargetEyeAspect + 1e-4f) {
+                const float croppedW = contentW * (kTargetEyeAspect / contentAspect);
+                pushConstants.videoResolution = { croppedW, contentH };
+                pushConstants.contentOrigin = { ((contentW - croppedW) * 0.5f) / texW, 0.0f };
             }
         } else {
             pushConstants.videoResolution = (hlslpp::float2(p.vi->fbSize()) * p.resolutionScale) / float(p.downsamplingScale);
