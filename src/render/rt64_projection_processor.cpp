@@ -4,6 +4,8 @@
 
 #include "rt64_projection_processor.h"
 
+#include <algorithm>
+
 #include "common/rt64_math.h"
 #include "hle/rt64_workload_queue.h"
 
@@ -83,13 +85,46 @@ namespace RT64 {
         convergenceWorld = static_cast<float>(convergenceSlider) * kConvergenceWorldScale;
     }
 
-    static void applyStereoOffAxis(interop::float4x4 &projMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceSlider) {
+    // Auto 3D scaling: keep the perceived depth constant when the game changes FOV.
+    //
+    // Screen disparity is proportional to separation / tan(fov/2), so a zoom that
+    // narrows the FOV inflates the 3D effect unless separation is scaled down to
+    // match. Dinosaur Planet's camera DLLs drive camSetFOV continuously (lock-on,
+    // first-person, cutscene framing, the 40..90 degree clamp in camSetFOV), so
+    // without this the depth visibly breathes as the camera works.
+    //
+    // guPerspectiveF writes m[1][1] = cot(fovY/2) and m[0][0] = cot(fovY/2)/aspect,
+    // so the VERTICAL term recovers the game's FOV on its own. Keying off m[0][0]
+    // instead would make the 3D strength react to the aspect-ratio setting and to
+    // RT64's widescreen adjustment, neither of which is a zoom.
+    //
+    // This is intentionally instantaneous rather than smoothed. The usual EMA
+    // assumes one update per frame, but this runs per projection and once per eye,
+    // so an EMA here would advance at a rate that depends on scene composition and
+    // would hand the two eyes different separations within a single frame — which
+    // breaks stereo outright. Being a pure function of the projection matrix, both
+    // eyes necessarily agree. Dino's FOV changes are already smoothed game-side.
+    static constexpr float kReferenceP11 = 1.7320508f;   // cot(30 deg), i.e. Dino's default 60 degree vertical FOV
+
+    static float stereoFovScale(const interop::float4x4 &projMatrix) {
+        const float p11 = projMatrix[1][1];
+        if (!(p11 > 0.0f)) {
+            return 1.0f;
+        }
+        const float scale = kReferenceP11 / p11;
+        // Bound it so a degenerate or unusual projection can't blow the separation
+        // up. camSetFOV clamps to 40..90 degrees, which is roughly 0.66..2.29 here.
+        return std::clamp(scale, 0.25f, 4.0f);
+    }
+
+    static void applyStereoOffAxis(interop::float4x4 &projMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceSlider, float separationScale) {
         if (eye == StereoEye::None) {
             return;
         }
         float separationWorld;
         float convergenceWorld;
         stereoWorldUnits(separationSlider, convergenceSlider, separationWorld, convergenceWorld);
+        separationWorld *= separationScale;
         float eyeOffset = 0.5f * separationWorld / convergenceWorld;
         constexpr float maxEyeOffset = 0.08f;
         if (eyeOffset > maxEyeOffset) eyeOffset = maxEyeOffset;
@@ -162,13 +197,17 @@ namespace RT64 {
     // closer objects pop out, farther objects push back. Without this shift,
     // every object gets the same constant disparity and the whole image just
     // slides sideways — the symptom the user reported as "can't get pop-out".
-    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceSlider) {
+    // separationScale must be the SAME value passed to applyStereoOffAxis for this
+    // projection, or the view and projection stop describing one camera and the
+    // convergence distance silently stops being where the user set it.
+    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceSlider, float separationScale) {
         if (eye == StereoEye::None) {
             return;
         }
         float separationWorld;
         float convergenceWorld;
         stereoWorldUnits(separationSlider, convergenceSlider, separationWorld, convergenceWorld);
+        separationWorld *= separationScale;
         // Match the clamp applied to the projection shift so the view and
         // projection stay geometrically consistent at extreme slider settings.
         // The 0.16 factor mirrors the projection's 0.08 max-offset cap (since
@@ -283,12 +322,19 @@ namespace RT64 {
 
             adjustProjectionMatrix(projMatrix, projRatioScale);
 
+            // Auto 3D scaling. Computed once here, from the current frame's
+            // projection, and reused for the view shift and for the previous
+            // frame's projection below — all three describe one camera, so they
+            // must share one value. Reading it off the projection also means the
+            // left and right eye passes derive the same number independently.
+            const float stereoSeparationScale = stereoFovScale(projMatrix);
+
             // Apply stereoscopic off-axis projection offset for world (gameplay)
             // and skybox projections.
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
                 isStereoProjectionId(curProjGroup.matrixId)) {
-                applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
+                applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence, stereoSeparationScale);
             }
 
             // Apply HUD depth shift to HUD/menu projections so the user can move
@@ -328,7 +374,11 @@ namespace RT64 {
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                     (proj.type == Projection::Type::Perspective) &&
                     isStereoProjectionId(curProjGroup.matrixId)) {
-                    applyStereoOffAxis(adjustedPrevProj, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
+                    // Deliberately the CURRENT frame's scale, not one derived from
+                    // adjustedPrevProj: the point is that both lerp endpoints carry
+                    // an identical stereo transform. Deriving it per-endpoint would
+                    // reintroduce the jitter this duplication exists to prevent.
+                    applyStereoOffAxis(adjustedPrevProj, p.stereoEye, p.stereoSeparation, p.stereoConvergence, stereoSeparationScale);
                 }
                 // Same HUD shift on the previous-frame projection, for the same
                 // reason the off-axis shift above is duplicated.
@@ -369,8 +419,8 @@ namespace RT64 {
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
                 isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
-                applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
-                applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
+                applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence, stereoSeparationScale);
+                applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, p.stereoConvergence, stereoSeparationScale);
             }
 
             viewProjMatrix = hlslpp::mul(viewMatrix, projMatrix);
