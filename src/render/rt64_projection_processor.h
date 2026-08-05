@@ -16,6 +16,18 @@ namespace RT64 {
         Right
     };
 
+    // Per-eye NDC.x offset for screen-space texture rectangles, matching the
+    // orthographic branch of the projection processor's HUD shift.
+    //
+    // Dinosaur Planet draws its HUD as rectangles rather than through an
+    // orthographic projection, so the rectangle path in FramebufferRenderer needs
+    // the same offset the projection path computes. This lives here, and is the
+    // single definition of that math, so the two paths cannot drift apart when
+    // the HUD tuning constants are retuned.
+    //
+    // Returns 0 when there is nothing to shift (mono, or the slider is neutral).
+    float stereoHudRectOffsetX(StereoEye eye, uint32_t hudDepthSlider);
+
     struct ProjectionProcessor {
         std::unique_ptr<BufferUploader> bufferUploader;
         std::vector<BufferUploader::Upload> uploads;

@@ -15,71 +15,72 @@ namespace RT64 {
         matrix[3][0] *= aspectRatioScale;
     }
 
-    // BanjoRecomp3D-specific transform IDs: see patches/transform_ids.h.
+    // Dinosaur Planet transform IDs: see patches/include/matrix_groups.h.
+    //
     // The world (gameplay) projection receives full per-eye stereo: projection
     // off-axis (inter-eye disparity) + view translation (depth-dependent parallax).
     // The skybox receives only the projection off-axis with no view shift, which
     // gives it the maximum positive parallax of an object at infinity — exactly
     // what we want so it sits well behind the world geometry.
-    // HUD/menu/cutscene-overlay projections (HUD, PRESS_START, BK_LOGO, COPYRIGHT,
-    // GAME_OVER, THE_END, TRANSITION, PILLARBOX, PORTRAITs) deliberately stay flat
-    // at the screen plane to remain readable.
-    static constexpr uint32_t BANJO_PROJECTION_GAMEPLAY_TRANSFORM_ID     = 0x00001000;
-    static constexpr uint32_t BANJO_PROJECTION_SKYBOX_TRANSFORM_ID       = 0x00001001;
-    static constexpr uint32_t BANJO_PROJECTION_TRANSITION_TRANSFORM_ID   = 0x00001002;
-    static constexpr uint32_t BANJO_PROJECTION_PRESS_START_TRANSFORM_ID  = 0x00001003;
-    static constexpr uint32_t BANJO_PROJECTION_HUD_TRANSFORM_ID          = 0x00001004;
-    static constexpr uint32_t BANJO_PROJECTION_BK_LOGO_TRANSFORM_ID      = 0x00001005;
-    static constexpr uint32_t BANJO_PROJECTION_COPYRIGHT_TRANSFORM_ID    = 0x00001006;
-    static constexpr uint32_t BANJO_PROJECTION_GAME_OVER_TRANSFORM_ID    = 0x00001007;
-    static constexpr uint32_t BANJO_PROJECTION_THE_END_TRANSFORM_ID      = 0x00001008;
-    static constexpr uint32_t BANJO_PROJECTION_PILLARBOX_TRANSFORM_ID    = 0x00001009;
-    static constexpr uint32_t BANJO_PROJECTION_DIALOG_BUBBLE_TRANSFORM_ID = 0x0000100A;
-    static constexpr uint32_t BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_START = 0x00001100;
-    static constexpr uint32_t BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_END   = 0x000011FF;
+    // HUD/menu/overlay projections deliberately stay flat at the user's chosen
+    // constant depth so they remain readable.
+    //
+    // Unlike the Banjo/Goemon ports, Dino's world projection was ALREADY tagged
+    // before stereo existed: patches/src/core/camera.c's camSetupRSPMatrices
+    // emits CAMERA_MTX_GROUP_ID_START + gCameraSelector (0x10..0x1F, one per
+    // camera selector) for RT64's frame interpolation. Stereo reuses that tag
+    // rather than introducing a parallel one, so the gameplay path needs no new
+    // patch at all. Only the skybox and HUD need their own IDs.
+    static constexpr uint32_t DINO_PROJECTION_CAMERA_TRANSFORM_ID_START = 0x00000010;
+    static constexpr uint32_t DINO_PROJECTION_CAMERA_TRANSFORM_ID_END   = 0x0000001F;
+    static constexpr uint32_t DINO_PROJECTION_SKYBOX_TRANSFORM_ID       = 0x00001001;
+    static constexpr uint32_t DINO_PROJECTION_HUD_TRANSFORM_ID          = 0x00001004;
 
+    static bool isStereoCameraProjectionId(uint32_t matrixId) {
+        return (matrixId >= DINO_PROJECTION_CAMERA_TRANSFORM_ID_START) &&
+               (matrixId <= DINO_PROJECTION_CAMERA_TRANSFORM_ID_END);
+    }
+
+    // Projections that get the off-axis shear: world geometry and the skybox.
     static bool isStereoProjectionId(uint32_t matrixId) {
-        return (matrixId == BANJO_PROJECTION_GAMEPLAY_TRANSFORM_ID) ||
-               (matrixId == BANJO_PROJECTION_SKYBOX_TRANSFORM_ID);
+        return isStereoCameraProjectionId(matrixId) ||
+               (matrixId == DINO_PROJECTION_SKYBOX_TRANSFORM_ID);
     }
 
+    // Projections that additionally get the lateral view shift. The skybox is
+    // excluded on purpose — that omission is what places it at infinity.
     static bool isStereoViewShiftProjectionId(uint32_t matrixId) {
-        return (matrixId == BANJO_PROJECTION_GAMEPLAY_TRANSFORM_ID);
+        return isStereoCameraProjectionId(matrixId);
     }
 
-    // HUD / dialog / text / cutscene-overlay projections that should receive
-    // the user's configured constant stereo depth (no view shift). The pillarbox
-    // is intentionally excluded because it's a screen-edge mask and looks weird
-    // if it moves out of plane. The transition fade is also excluded for the
-    // same reason.
+    // HUD / menu / text projections that should receive the user's configured
+    // constant stereo depth (no view shift).
     static bool isStereoHudProjectionId(uint32_t matrixId) {
-        if (matrixId == BANJO_PROJECTION_HUD_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_PRESS_START_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_BK_LOGO_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_COPYRIGHT_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_GAME_OVER_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_THE_END_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_DIALOG_BUBBLE_TRANSFORM_ID) return true;
-        if ((matrixId >= BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_START) &&
-            (matrixId <= BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_END)) return true;
-        return false;
-    }
-
-    // The dialog bubble specifically needs a stronger HUD shift than the
-    // default perspective-HUD path provides, so it lands at the same depth as
-    // the text rectangles drawn alongside it. Other perspective-HUD elements
-    // (press-start logo, BK title logo, etc.) keep the original P[0][0]-based
-    // shift so we don't alter behavior the user already signed off on.
-    static bool isStereoBubbleProjectionId(uint32_t matrixId) {
-        return (matrixId == BANJO_PROJECTION_DIALOG_BUBBLE_TRANSFORM_ID);
+        return (matrixId == DINO_PROJECTION_HUD_TRANSFORM_ID);
     }
 
     // Convert the user-facing 0..100 sliders to world-space stereo parameters.
     // Centralised here so applyStereoOffAxis and applyStereoViewShift always agree.
+    //
+    // Dino's world scale: near plane 4.0, far plane 10000.0 (camera.c), and the
+    // camera DLLs work at 20..250 units from the subject (84_camnormal, 91_camlockon,
+    // 92_camshipbattle, 86_cam1stperson). Convergence therefore wants to land near
+    // ~200 units at the default slider of 20, which is why the multiplier is 10 and
+    // not Banjo's 20 (its cameras sit roughly twice as far out).
+    //
+    // Separation is then chosen so the default (sep 50, conv 20) produces an
+    // eyeOffset of 0.5 * 7.5 / 200 = 0.019 — comfortably below the 0.08 clamp, so
+    // the slider has usable range in both directions instead of saturating.
+    //
+    // RETUNE THESE TWO FIRST if the 3D reads too strong/weak in game; everything
+    // else in this file is geometry and should not need touching.
+    static constexpr float kSeparationWorldScale  = 0.15f;   // slider 50  -> 7.5 units
+    static constexpr float kConvergenceWorldScale = 10.0f;   // slider 20  -> 200 units
+
     static void stereoWorldUnits(uint32_t separationSlider, uint32_t convergenceSlider,
                                  float &separationWorld, float &convergenceWorld) {
-        separationWorld = static_cast<float>(separationSlider);                     // 0..100 game units
-        convergenceWorld = static_cast<float>(convergenceSlider) * 20.0f;           // 20..2000 game units (slider min 1)
+        separationWorld = static_cast<float>(separationSlider) * kSeparationWorldScale;
+        convergenceWorld = static_cast<float>(convergenceSlider) * kConvergenceWorldScale;
     }
 
     static void applyStereoOffAxis(interop::float4x4 &projMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceSlider) {
@@ -108,40 +109,50 @@ namespace RT64 {
     //     After the perspective divide this becomes a constant NDC shift.
     //   - Orthographic: there is no perspective divide, so we add a direct NDC
     //     shift via m[3][0].
-    static void applyStereoHudShift(interop::float4x4 &projMatrix, StereoEye eye, uint32_t hudDepthSlider, bool isOrthographic, bool matchOrthoScale = false) {
-        if (eye == StereoEye::None) {
-            return;
+    // Slider 0..100 -> signed NDC-space HUD offset, before the per-projection-type
+    // scaling below. Shared by the projection path and the texture-rectangle path.
+    static constexpr float kMaxHudOffset = 0.04f;
+
+    // For perspective, m[2][0] += K produces an NDC.x shift of -K (after the
+    // right-handed perspective divide). For ortho, m[3][0] += K produces an NDC.x
+    // shift of +K directly. To make the slider push HUD the same direction across
+    // both projection types we apply the opposite sign to ortho. The scale factor
+    // is 1/tan(FOV/2), which matches the visible magnitude so text and icons sit at
+    // the same depth at the same slider value.
+    //
+    // Dino's default vertical FOV is 60 degrees (camInit / camResetProjection;
+    // camSetFOV clamps to 40..90), so this is 1/tan(30 deg) = 1.732 — NOT Banjo's
+    // 2.75, which was derived from its 40 degree FOV.
+    static constexpr float kPerspectiveToOrthoScale = 1.7320508f;
+
+    static float stereoHudNdcOffset(StereoEye eye, uint32_t hudDepthSlider) {
+        if ((eye == StereoEye::None) || (hudDepthSlider == 50)) {
+            return 0.0f;
         }
         const float centered = (static_cast<float>(hudDepthSlider) - 50.0f) / 50.0f; // -1..+1
-        constexpr float maxHudOffset = 0.04f;
         // Negate so slider > 50 produces pop-out (negative parallax) and
         // slider < 50 produces push-back (positive parallax).
-        const float hudOffset = -centered * maxHudOffset;
+        const float hudOffset = -centered * kMaxHudOffset;
         const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
-        if (isOrthographic) {
-            // For perspective, m[2][0] += K produces an NDC.x shift of -K (after
-            // right-handed perspective divide). For ortho, m[3][0] += K produces
-            // an NDC.x shift of +K directly. To make the slider push HUD in the
-            // same direction across both projection types we apply the opposite
-            // sign to ortho. The scale factor (~1/tan(FOV/2) for BK's 40° FOV)
-            // matches the visible magnitude so dialog/text and icons sit at the
-            // same depth at the same slider value.
-            constexpr float perspectiveToOrthoScale = 2.75f;
-            projMatrix[3][0] -= eyeSign * hudOffset * perspectiveToOrthoScale;
+        return eyeSign * hudOffset;
+    }
+
+    float stereoHudRectOffsetX(StereoEye eye, uint32_t hudDepthSlider) {
+        // Negation mirrors the orthographic branch below so rectangles shift in
+        // the same direction as everything else.
+        return -stereoHudNdcOffset(eye, hudDepthSlider) * kPerspectiveToOrthoScale;
+    }
+
+    static void applyStereoHudShift(interop::float4x4 &projMatrix, StereoEye eye, uint32_t hudDepthSlider, bool isOrthographic) {
+        const float signedOffset = stereoHudNdcOffset(eye, hudDepthSlider);
+        if (signedOffset == 0.0f) {
+            return;
         }
-        else if (matchOrthoScale) {
-            // For the dialog bubble, use a constant scale tuned empirically to
-            // match the text and portrait shift at the same slider value.
-            // (The math suggests 2.75 should match the ortho/text NDC shift
-            // one-for-one, but in practice that overshoots — the bubble's
-            // full transform chain through gameplay's view matrix amplifies
-            // the projection-side shift. Adjust this constant if the bubble
-            // depth still drifts from the text.)
-            constexpr float bubbleHudScale = 1.3f;
-            projMatrix[2][0] += eyeSign * hudOffset * bubbleHudScale;
+        if (isOrthographic) {
+            projMatrix[3][0] -= signedOffset * kPerspectiveToOrthoScale;
         }
         else {
-            projMatrix[2][0] += eyeSign * hudOffset * projMatrix[0][0];
+            projMatrix[2][0] += signedOffset * projMatrix[0][0];
         }
     }
 
@@ -280,28 +291,25 @@ namespace RT64 {
                 applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
             }
 
-            // Apply HUD depth shift to HUD/dialog/cutscene-overlay projections so
-            // the user can move them off the screen plane. When the slider is at
-            // 50 (neutral) this is a no-op and the HUD stays flat as before.
-            // Any orthographic projection counts as HUD in BK (the world is the
-            // only thing the game renders in perspective), plus the explicit HUD
-            // perspective IDs (pause menu, GAME OVER, dialog overlay, etc.).
-            // Gameplay and skybox perspective projections are explicitly skipped
-            // so the world stereo isn't disturbed.
+            // Apply HUD depth shift to HUD/menu projections so the user can move
+            // them off the screen plane. When the slider is at 50 (neutral) this
+            // is a no-op and the HUD stays flat as before.
+            //
+            // Unlike the Banjo port, an orthographic projection alone does NOT
+            // qualify as HUD here: Dinosaur Planet renders its shadow textures
+            // through camSetOrthoProjectionMatrix (shadowtex.c), and shifting
+            // those per-eye would corrupt the shadows rather than move a UI layer.
+            // Only an explicit HUD tag qualifies, so anything untagged — shadow
+            // passes, FMV/cutscene playback — is left alone and cannot flicker as
+            // the per-eye shifts go in opposite directions. isOrtho still selects
+            // WHICH matrix element receives the shift.
             {
-                // Apply HUD depth to orthographic projections (BK uses ortho only
-                // for UI/2D content) and to perspective projections explicitly
-                // tagged with HUD-like IDs. Untagged perspective projections —
-                // such as FMV/cutscene playback — are left alone so they don't
-                // flicker as the per-eye shifts go in opposite directions.
                 const bool isOrtho = (proj.type == Projection::Type::Orthographic);
-                const bool isHudProjection = (!isStereoProjectionId(curProjGroup.matrixId)) &&
-                    (isOrtho || isStereoHudProjectionId(curProjGroup.matrixId));
-                const bool matchOrthoScale = isStereoBubbleProjectionId(curProjGroup.matrixId);
+                const bool isHudProjection = isStereoHudProjectionId(curProjGroup.matrixId);
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                     isHudProjection &&
                     (p.stereoHudDepth != 50)) {
-                    applyStereoHudShift(projMatrix, p.stereoEye, p.stereoHudDepth, isOrtho, matchOrthoScale);
+                    applyStereoHudShift(projMatrix, p.stereoEye, p.stereoHudDepth, isOrtho);
                 }
             }
 
@@ -322,15 +330,15 @@ namespace RT64 {
                     isStereoProjectionId(curProjGroup.matrixId)) {
                     applyStereoOffAxis(adjustedPrevProj, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
                 }
+                // Same HUD shift on the previous-frame projection, for the same
+                // reason the off-axis shift above is duplicated.
                 {
                     const bool isOrtho = (proj.type == Projection::Type::Orthographic);
-                    const bool isHudProjection = (!isStereoProjectionId(curProjGroup.matrixId)) &&
-                        (isOrtho || isStereoHudProjectionId(curProjGroup.matrixId));
-                    const bool matchOrthoScale = isStereoBubbleProjectionId(curProjGroup.matrixId);
+                    const bool isHudProjection = isStereoHudProjectionId(curProjGroup.matrixId);
                     if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                         isHudProjection &&
                         (p.stereoHudDepth != 50)) {
-                        applyStereoHudShift(adjustedPrevProj, p.stereoEye, p.stereoHudDepth, isOrtho, matchOrthoScale);
+                        applyStereoHudShift(adjustedPrevProj, p.stereoEye, p.stereoHudDepth, isOrtho);
                     }
                 }
                 viewMatrix = rigidBody->lerp(p.curFrameWeight, *prevViewMatrix, curViewTransform, true);

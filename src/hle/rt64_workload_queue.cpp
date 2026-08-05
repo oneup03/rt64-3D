@@ -657,20 +657,9 @@ namespace RT64 {
                     // orthographic path so screen-rect UI lands at the same
                     // visible depth as ortho-projected UI.
                     drawParams.stereoRectOffsetX = 0.0f;
-                    if ((stereoMode != UserConfiguration::StereoMode::Off) &&
-                        (stereoEye != StereoEye::None)) {
-                        const auto hudDepth = ext.sharedResources->userConfig.stereoHudDepth;
-                        if (hudDepth != 50) {
-                            const float centered = (static_cast<float>(hudDepth) - 50.0f) / 50.0f;
-                            constexpr float maxHudOffset = 0.04f;
-                            const float hudOffset = -centered * maxHudOffset;
-                            constexpr float perspectiveToOrthoScale = 2.75f;
-                            const float eyeSign = (stereoEye == StereoEye::Left) ? +1.0f : -1.0f;
-                            // Negation mirrors applyStereoHudShift's orthographic
-                            // branch so rectangles shift in the same direction
-                            // as everything else.
-                            drawParams.stereoRectOffsetX = -eyeSign * hudOffset * perspectiveToOrthoScale;
-                        }
+                    if (stereoMode != UserConfiguration::StereoMode::Off) {
+                        drawParams.stereoRectOffsetX = stereoHudRectOffsetX(
+                            stereoEye, ext.sharedResources->userConfig.stereoHudDepth);
                     }
                     framebufferRenderer->addFramebuffer(drawParams);
                 }
