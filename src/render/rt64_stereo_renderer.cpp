@@ -63,15 +63,26 @@ namespace RT64 {
         // bytes into the GPU buffer.
         interop::StereoComposeCB pushConstants = {};
         pushConstants.contentOrigin = { 0.0f, 0.0f };
+        pushConstants.rightContentOrigin = { 0.0f, 0.0f };
         if (p.isUIOverlay) {
             // Force the shader's videoResolution/textureResolution ratio to 1
             // so the no-op rescale at the bottom of PSMain leaves the
             // normalized UV unchanged, then SampleEye's overlay-mode branch
             // samples the full UI texture across each eye half.
+            // Both eye slots are bound to the same UI texture here, so the right
+            // eye gets the same identity mapping.
             pushConstants.videoResolution = { 1.0f, 1.0f };
             pushConstants.textureResolution = { 1.0f, 1.0f };
+            pushConstants.rightVideoResolution = { 1.0f, 1.0f };
+            pushConstants.rightTextureResolution = { 1.0f, 1.0f };
             pushConstants.gamma = 1.0f;
         } else if (p.fillFullTarget) {
+            // Computed per eye. See the note on RenderParams::rightTextureWidth:
+            // the eye textures are independent render targets and can differ in
+            // size, and normalizing both by one of them samples the wrong region
+            // of the other — visible as one eye zoomed against its partner.
+            auto eyeContent = [&](uint32_t texWidth, uint32_t texHeight,
+                                  interop::float2 &videoRes, interop::float2 &texRes, interop::float2 &origin) {
             // Stretch the eye texture's CONTENT across each SbS / TaB /
             // Interlaced / LeiaSR-intermediate slot, so each half gets the whole
             // rendered view — the "fills the half" behavior stereo wants.
@@ -87,15 +98,15 @@ namespace RT64 {
             // VIRenderer path does, rather than assuming texture == content. When
             // the content genuinely does fill the target (the Expand-aspect
             // gameplay case) this resolves to the full texture and is a no-op.
-            const float texW = static_cast<float>(p.textureWidth ? p.textureWidth : 1);
-            const float texH = static_cast<float>(p.textureHeight ? p.textureHeight : 1);
+            const float texW = static_cast<float>(texWidth ? texWidth : 1);
+            const float texH = static_cast<float>(texHeight ? texHeight : 1);
 
             float contentW = texW;
             float contentH = texH;
             if (p.vi != nullptr) {
-                const hlslpp::float2 videoRes = (hlslpp::float2(p.vi->fbSize()) * p.resolutionScale) / float(p.downsamplingScale);
-                const float viW = static_cast<float>(videoRes.x);
-                const float viH = static_cast<float>(videoRes.y);
+                const hlslpp::float2 viRes = (hlslpp::float2(p.vi->fbSize()) * p.resolutionScale) / float(p.downsamplingScale);
+                const float viW = static_cast<float>(viRes.x);
+                const float viH = static_cast<float>(viRes.y);
                 // Ignore a degenerate VI size rather than composing a blank or
                 // wildly zoomed frame from it; the full texture is the safe
                 // fallback. Clamp to the texture because sampling past the
@@ -106,10 +117,9 @@ namespace RT64 {
                 }
             }
 
-            pushConstants.videoResolution = { contentW, contentH };
-            pushConstants.textureResolution = { texW, texH };
-            pushConstants.contentOrigin = { 0.0f, 0.0f };
-            pushConstants.gamma = p.vi ? p.vi->gamma() : 1.0f;
+            videoRes = { contentW, contentH };
+            texRes = { texW, texH };
+            origin = { 0.0f, 0.0f };
 
             // When the rendered view is wider than 16:9 per eye (typical on
             // ultrawide / 32:9 desktops, where full-SbS AR glasses split the
@@ -119,19 +129,34 @@ namespace RT64 {
             // aspect is ~16:9 and this is a no-op.
             //
             // Measured on the content rect, not the texture, or a partially
-            // filled target would be judged by the wrong aspect. contentOrigin
-            // is in normalized TEXTURE uv, so the centering offset divides by
-            // texW rather than contentW.
+            // filled target would be judged by the wrong aspect. The origin is
+            // in normalized TEXTURE uv, so the centering offset divides by texW
+            // rather than contentW.
             const float contentAspect = (contentH > 0.0f) ? (contentW / contentH) : 1.0f;
             constexpr float kTargetEyeAspect = 16.0f / 9.0f;
             if (contentAspect > kTargetEyeAspect + 1e-4f) {
                 const float croppedW = contentW * (kTargetEyeAspect / contentAspect);
-                pushConstants.videoResolution = { croppedW, contentH };
-                pushConstants.contentOrigin = { ((contentW - croppedW) * 0.5f) / texW, 0.0f };
+                videoRes = { croppedW, contentH };
+                origin = { ((contentW - croppedW) * 0.5f) / texW, 0.0f };
             }
+            };
+
+            eyeContent(p.textureWidth, p.textureHeight,
+                       pushConstants.videoResolution, pushConstants.textureResolution, pushConstants.contentOrigin);
+            eyeContent(p.rightTextureWidth ? p.rightTextureWidth : p.textureWidth,
+                       p.rightTextureHeight ? p.rightTextureHeight : p.textureHeight,
+                       pushConstants.rightVideoResolution, pushConstants.rightTextureResolution, pushConstants.rightContentOrigin);
+            pushConstants.gamma = p.vi ? p.vi->gamma() : 1.0f;
         } else {
+            // Same content region for both eyes, but each normalized by its own
+            // texture size.
             pushConstants.videoResolution = (hlslpp::float2(p.vi->fbSize()) * p.resolutionScale) / float(p.downsamplingScale);
             pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
+            pushConstants.rightVideoResolution = pushConstants.videoResolution;
+            pushConstants.rightTextureResolution = {
+                float(p.rightTextureWidth ? p.rightTextureWidth : p.textureWidth),
+                float(p.rightTextureHeight ? p.rightTextureHeight : p.textureHeight)
+            };
             pushConstants.gamma = p.vi->gamma();
         }
         // LeiaSR's intermediate is SbS-packed, so the shader uses the

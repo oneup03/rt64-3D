@@ -37,6 +37,13 @@ namespace RT64 {
             uint32_t downsamplingScale = 0;
             uint32_t textureWidth = 0;
             uint32_t textureHeight = 0;
+            // Dimensions of the right eye's texture. The two eyes are separate
+            // render targets that are resized independently, so these are not
+            // necessarily the same as the left's. Left as zero, they fall back to
+            // the left eye's dimensions, which is correct for callers that bind
+            // one texture to both slots (the UI overlay pass).
+            uint32_t rightTextureWidth = 0;
+            uint32_t rightTextureHeight = 0;
             UserConfiguration::StereoMode stereoMode = UserConfiguration::StereoMode::Off;
             const VI *vi = nullptr;
             bool removeBlackBorders = false;

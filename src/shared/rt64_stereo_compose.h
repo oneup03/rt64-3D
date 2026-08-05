@@ -38,13 +38,39 @@ namespace interop {
         // those pillarbox bars so each SbS/TaB/Interlaced eye slot shows the
         // game content directly. Default 0 keeps backward compatibility.
         float2 contentOrigin;     // offset 32
+
+        // The right eye's equivalents of the three fields above.
+        //
+        // The two eye textures are separate render targets, created and resized
+        // independently — RT64 grows a target when the game needs more and never
+        // shrinks it, so the left and right targets can legitimately end up
+        // different sizes. Normalizing both eyes by one texture resolution then
+        // samples the wrong region of whichever eye did not match, which shows up
+        // as one eye zoomed relative to the other.
+        //
+        // Offsets 40 and 56 both sit inside a 16-byte chunk (32..48 and 48..64),
+        // so no additional padding is needed — but keep that in mind before
+        // reordering, per the _pad0 note above.
+        float2 rightVideoResolution;   // offset 40
+        float2 rightTextureResolution; // offset 48
+        float2 rightContentOrigin;     // offset 56 - closes the 64-byte chunk
+
         // Ghost-reduction (anti-crosstalk) levers, applied last in the shader.
         // ghostContrast 1.0 and ghostBlackFloor 0.0 are exact no-ops and the
-        // shader skips the math for them. These two floats consume the tail
-        // padding the struct already had (40 bytes rounded up to 48), so the
-        // constant buffer size is unchanged.
-        float ghostContrast;      // offset 40
-        float ghostBlackFloor;    // offset 44 - closes the 48-byte chunk
+        // shader skips the math for them.
+        //
+        // The two floats land at 64 and 68, inside the 64..80 chunk, but take
+        // the struct to 72 bytes, so the TAIL is padded too. HLSL rounds a
+        // constant buffer up to a 16-byte multiple, making the shader side 80
+        // bytes (20 dwords) whatever C++ says, while the D3D12 backend sizes the
+        // root constants as ceil(sizeof / 4) = 18 dwords - and a root signature
+        // declaring fewer constants than the shader's cbuffer needs is rejected
+        // at pipeline creation. Padding to 80 makes the two agree. Any new
+        // vector goes after the padding, per the _pad0 note above.
+        float ghostContrast;      // offset 64
+        float ghostBlackFloor;    // offset 68
+        float _pad1;              // offset 72
+        float _pad2;              // offset 76 - closes the 80-byte chunk
     };
 #ifdef HLSL_CPU
 };
