@@ -456,9 +456,23 @@ namespace RT64 {
                             // service missing, etc.) sets leiaSRInitAttempted
                             // so we don't keep retrying every frame.
                             if (!leiaSRWeaver.isAvailable() && !leiaSRInitAttempted) {
-                                auto *d3dDevice = static_cast<plume::D3D12Device *>(ext.device);
-                                leiaSRWeaver.initialize(d3dDevice ? d3dDevice->d3d : nullptr, ext.appWindow->windowHandle);
-                                leiaSRInitAttempted = true;
+                                // Don't bring the weaver up against a swap chain
+                                // that hasn't been sized yet — the intermediate
+                                // is derived from these dimensions, and a zero
+                                // extent would have us create a degenerate
+                                // texture and hand the SDK a viewport it cannot
+                                // make sense of. Retry on a later frame instead;
+                                // leiaSRInitAttempted stays false so this is not
+                                // a one-shot failure.
+                                const uint32_t swapW = ext.swapChain->getWidth();
+                                const uint32_t swapH = ext.swapChain->getHeight();
+                                if ((swapW > 0) && (swapH > 0)) {
+                                    auto *d3dDevice = static_cast<plume::D3D12Device *>(ext.device);
+                                    fprintf(stderr, "LeiaSR: initializing against swap chain %ux%u.\n", swapW, swapH);
+                                    fflush(stderr);
+                                    leiaSRWeaver.initialize(d3dDevice ? d3dDevice->d3d : nullptr, ext.appWindow->windowHandle);
+                                    leiaSRInitAttempted = true;
+                                }
                             }
 
                             if (leiaSRWeaver.isAvailable()) {
