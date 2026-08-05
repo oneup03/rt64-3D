@@ -15,7 +15,10 @@ SamplerState gSampler : register(s3);
 // pass: samples the source UV directly and returns the texel as-is so alpha-
 // transparent regions stay transparent and the UI's full-screen layout isn't
 // squeezed to a sub-region.
-float4 SampleEye(Texture2D<float4> tex, float2 uv) {
+// videoRes / texRes / origin describe the content rect of THIS eye's texture.
+// They are passed per eye rather than read from gConstants directly because the
+// two eye textures are independent render targets and can differ in size.
+float4 SampleEye(Texture2D<float4> tex, float2 uv, float2 videoRes, float2 texRes, float2 origin) {
     if (gConstants.useUIOverlayMode != 0) {
         // Slightly reduce the UI's opacity so gameplay remains visible through
         // it. 0.75 keeps the GUI clearly readable but lets enough of the world
@@ -25,14 +28,14 @@ float4 SampleEye(Texture2D<float4> tex, float2 uv) {
         return c;
     }
     // Content rect in normalized texture UV space:
-    //   origin = gConstants.contentOrigin
-    //   extent = videoResolution / textureResolution
+    //   origin = origin
+    //   extent = videoRes / texRes
     // For full-texture content (Original / non-Expand modes) origin is 0 and
     // extent is 1, matching the original VI sampling exactly.
-    const float2 ContentExtent = gConstants.videoResolution / gConstants.textureResolution;
-    const float2 ContentMin = gConstants.contentOrigin;
+    const float2 ContentExtent = videoRes / texRes;
+    const float2 ContentMin = origin;
     const float2 ContentMax = ContentMin + ContentExtent;
-    const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
+    const float2 HalfPixel = float2(0.5f, 0.5f) / texRes;
     float2 outsideBorder = step(ContentMax, uv) + step(uv + HalfPixel, ContentMin);
     float4 sampledColor = tex.SampleLevel(gSampler, clamp(uv, ContentMin + HalfPixel, ContentMax - HalfPixel), 0);
     float4 gammaCorrectedColor = pow(sampledColor, gConstants.gamma);
@@ -82,13 +85,17 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
         break;
     }
 
-    // Map the per-eye uv (0..1 across each eye's slot) onto the eye texture's
+    // Map the per-eye uv (0..1 across each eye's slot) onto that eye texture's
     // content rect: [contentOrigin, contentOrigin + videoResolution /
     // textureResolution]. When contentOrigin is zero and videoResolution ==
     // textureResolution this collapses to the identity uv mapping, matching
     // the original VI sampling.
+    //
+    // Each eye uses its OWN rect. The eye textures are separate render targets
+    // and can differ in size, in which case a shared mapping would sample the
+    // wrong region of one of them and show it zoomed against the other.
     leftSampleUv  = gConstants.contentOrigin + (leftSampleUv  / gConstants.textureResolution) * gConstants.videoResolution;
-    rightSampleUv = gConstants.contentOrigin + (rightSampleUv / gConstants.textureResolution) * gConstants.videoResolution;
+    rightSampleUv = gConstants.rightContentOrigin + (rightSampleUv / gConstants.rightTextureResolution) * gConstants.rightVideoResolution;
 
     if (mixEyes) {
         // UI overlay path always has both eye slots bound to the same UI
@@ -99,7 +106,7 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
         // screen would blank out. Sidestep the mix in UI mode and return the
         // UI sample untouched so the overlay blends normally.
         if (gConstants.useUIOverlayMode != 0) {
-            return SampleEye(gLeftEye, leftSampleUv);
+            return SampleEye(gLeftEye, leftSampleUv, gConstants.videoResolution, gConstants.textureResolution, gConstants.contentOrigin);
         }
         // Red-cyan anaglyph using a full cross-talk RGB matrix. Each output
         // channel takes weighted contributions from BOTH eyes (positive from
@@ -108,8 +115,8 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
         // noticeably less retinal-rivalry-prone image than the simpler
         // Dubois matrix that ignores cross-eye terms. Wear glasses with the
         // red lens on the LEFT eye.
-        float4 cA = SampleEye(gLeftEye,  leftSampleUv);
-        float4 cB = SampleEye(gRightEye, rightSampleUv);
+        float4 cA = SampleEye(gLeftEye,  leftSampleUv, gConstants.videoResolution, gConstants.textureResolution, gConstants.contentOrigin);
+        float4 cB = SampleEye(gRightEye, rightSampleUv, gConstants.rightVideoResolution, gConstants.rightTextureResolution, gConstants.rightContentOrigin);
         float r = saturate( 0.437 * cA.r + 0.449 * cA.g + 0.164 * cA.b
                            - 0.011 * cB.r - 0.032 * cB.g - 0.007 * cB.b);
         float g = saturate(-0.062 * cA.r - 0.062 * cA.g - 0.024 * cA.b
@@ -119,7 +126,7 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
         return float4(r, g, b, 1.0f);
     }
     if (useRight) {
-        return SampleEye(gRightEye, rightSampleUv);
+        return SampleEye(gRightEye, rightSampleUv, gConstants.rightVideoResolution, gConstants.rightTextureResolution, gConstants.rightContentOrigin);
     }
-    return SampleEye(gLeftEye, leftSampleUv);
+    return SampleEye(gLeftEye, leftSampleUv, gConstants.videoResolution, gConstants.textureResolution, gConstants.contentOrigin);
 }

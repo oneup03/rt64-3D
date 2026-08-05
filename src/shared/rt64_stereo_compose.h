@@ -38,6 +38,22 @@ namespace interop {
         // those pillarbox bars so each SbS/TaB/Interlaced eye slot shows the
         // game content directly. Default 0 keeps backward compatibility.
         float2 contentOrigin;     // offset 32
+
+        // The right eye's equivalents of the three fields above.
+        //
+        // The two eye textures are separate render targets, created and resized
+        // independently — RT64 grows a target when the game needs more and never
+        // shrinks it, so the left and right targets can legitimately end up
+        // different sizes. Normalizing both eyes by one texture resolution then
+        // samples the wrong region of whichever eye did not match, which shows up
+        // as one eye zoomed relative to the other.
+        //
+        // Offsets 40 and 56 both sit inside a 16-byte chunk (32..48 and 48..64),
+        // so no additional padding is needed — but keep that in mind before
+        // reordering, per the _pad0 note above.
+        float2 rightVideoResolution;   // offset 40
+        float2 rightTextureResolution; // offset 48
+        float2 rightContentOrigin;     // offset 56
     };
 #ifdef HLSL_CPU
 };

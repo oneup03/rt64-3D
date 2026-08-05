@@ -414,6 +414,13 @@ namespace RT64 {
                         stereoParams.downsamplingScale = renderParams.downsamplingScale;
                         stereoParams.textureWidth = renderParams.textureWidth;
                         stereoParams.textureHeight = renderParams.textureHeight;
+                        // The right eye's own dimensions, resolved above. The two
+                        // eye targets are resized independently, so passing only
+                        // the left's made the shader normalize both by it and
+                        // sample the wrong region of the right eye whenever they
+                        // diverged — one eye zoomed against the other.
+                        stereoParams.rightTextureWidth = rightTextureWidth;
+                        stereoParams.rightTextureHeight = rightTextureHeight;
                         stereoParams.stereoMode = stereoMode;
                         stereoParams.vi = renderParams.vi;
                         stereoParams.removeBlackBorders = renderParams.removeBlackBorders;
