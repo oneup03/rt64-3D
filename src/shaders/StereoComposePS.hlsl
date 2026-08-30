@@ -41,6 +41,42 @@ float4 SampleEye(Texture2D<float4> tex, float2 uv) {
     return gammaCorrectedColor;
 }
 
+// Ghost reduction (anti-crosstalk range compression). Every stereo display
+// leaks part of each eye's image into the other, and how visible that leak is
+// depends on the brightness difference between the eyes — so compressing the
+// signal range before it reaches the display reduces what's visible. Displays
+// that cancel crosstalk themselves (autostereo panels, LeiaSR) pre-subtract a
+// fraction of the opposite eye, which drives values past the ends of the range
+// where the render target clamps them; the clamped part is what survives as a
+// ghost, so the black lift exists to give that subtraction foot-room.
+//
+//   contrast: squeezes toward mid-grey, shrinking |L - R| directly. Costs
+//             contrast across the whole image. 1.0 = off.
+//   lift:     raises the black floor and leaves white alone, which is where
+//             cancellation clips. Costs black level. 0.0 = off. Only helps on
+//             displays that actually cancel.
+//
+// No gamma decode here on purpose: this runs on values already in the
+// encoding we hand the display, and the LeiaSR weaver is created with
+// SetShaderSRGBConversion(false, false) — it cancels in exactly these values,
+// so we must pivot around 0.5 in the same space rather than in linear light.
+// Being "more correct" than the runtime only desynchronises the two.
+//
+// The remap is affine, and an affine remap commutes exactly with alpha
+// blending as long as both layers get the same coefficients. That's what lets
+// the UI overlay pass apply it to its own samples and still land on the same
+// result as one remap over the finished composite — which matters, because a
+// bright HUD over a dark scene is the content that ghosts worst.
+float3 GhostReduce(float3 c) {
+    if ((gConstants.ghostContrast >= 1.0f) && (gConstants.ghostBlackFloor <= 0.0f)) {
+        return c;
+    }
+    float3 v = saturate(c);
+    v = (v - 0.5f) * gConstants.ghostContrast + 0.5f;
+    v = v * (1.0f - gConstants.ghostBlackFloor) + gConstants.ghostBlackFloor;
+    return saturate(v);
+}
+
 float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
     // Default: pass through left eye (matches VideoInterfacePSRegular behavior so
     // that any unrecognized mode produces a usable mono frame instead of black).
@@ -99,7 +135,9 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
         // screen would blank out. Sidestep the mix in UI mode and return the
         // UI sample untouched so the overlay blends normally.
         if (gConstants.useUIOverlayMode != 0) {
-            return SampleEye(gLeftEye, leftSampleUv);
+            float4 uiColor = SampleEye(gLeftEye, leftSampleUv);
+            uiColor.rgb = GhostReduce(uiColor.rgb);
+            return uiColor;
         }
         // Red-cyan anaglyph using a full cross-talk RGB matrix. Each output
         // channel takes weighted contributions from BOTH eyes (positive from
@@ -116,10 +154,10 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
                            + 0.377 * cB.r + 0.761 * cB.g + 0.009 * cB.b);
         float b = saturate(-0.048 * cA.r - 0.050 * cA.g - 0.017 * cA.b
                            - 0.026 * cB.r - 0.093 * cB.g + 1.234 * cB.b);
-        return float4(r, g, b, 1.0f);
+        return float4(GhostReduce(float3(r, g, b)), 1.0f);
     }
-    if (useRight) {
-        return SampleEye(gRightEye, rightSampleUv);
-    }
-    return SampleEye(gLeftEye, leftSampleUv);
+    float4 outColor = useRight ? SampleEye(gRightEye, rightSampleUv)
+                                : SampleEye(gLeftEye, leftSampleUv);
+    outColor.rgb = GhostReduce(outColor.rgb);
+    return outColor;
 }

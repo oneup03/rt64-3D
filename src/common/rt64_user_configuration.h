@@ -115,13 +115,26 @@ namespace RT64 {
         bool idleWorkActive;
         bool developerMode;
         StereoMode stereoMode;
-        // Slider value 0..100 set from the host application; converted to
-        // world-space units by the renderer.
+        // Slider values set from the host application; converted to world-space
+        // units by the renderer. Separation is 0..50 (0..0.10 of screen width).
+        // Convergence is in TENTHS of its slider, 1..500 (= 0.1..50), so the
+        // slider can step below 1 without this bridge going floating point.
         uint32_t stereoSeparation;
         uint32_t stereoConvergence;
         // HUD/textbox depth slider. 50 = screen plane (mono). Below 50 the HUD
         // is pushed behind the screen; above 50 it pops out toward the viewer.
         uint32_t stereoHudDepth;
+        // Ghost-reduction (anti-crosstalk) range compression applied by the
+        // stereo compose shader. Every stereo display leaks part of each eye's
+        // image into the other, and how visible that leak is depends on the
+        // brightness difference between the eyes, so compressing the range
+        // before the image reaches the display reduces what's visible.
+        //   stereoGhostContrast:   0..100 percent. 100 = off (no squeeze).
+        //   stereoGhostBlackFloor: 0..100 percent. 0 = off (no lift).
+        // Both are exact no-ops at their defaults and the shader skips the
+        // math entirely when they're both there.
+        uint32_t stereoGhostContrast;
+        uint32_t stereoGhostBlackFloor;
 
         UserConfiguration();
         void validate();

@@ -111,6 +111,12 @@ namespace RT64 {
         }
         pushConstants.stereoMode = static_cast<uint32_t>(shaderStereoMode);
         pushConstants.useUIOverlayMode = p.isUIOverlay ? 1u : 0u;
+        // The UI overlay pass gets the same two values as the world pass on
+        // purpose: the remap is affine, so applying it to both layers is
+        // identical to applying it once to the blended result, and the UI is
+        // exactly the high-contrast content that ghosts worst.
+        pushConstants.ghostContrast = p.ghostContrast;
+        pushConstants.ghostBlackFloor = p.ghostBlackFloor;
 
         p.commandList->setPipeline(shader->pipeline.get());
         p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());
