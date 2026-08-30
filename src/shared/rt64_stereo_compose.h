@@ -38,6 +38,13 @@ namespace interop {
         // those pillarbox bars so each SbS/TaB/Interlaced eye slot shows the
         // game content directly. Default 0 keeps backward compatibility.
         float2 contentOrigin;     // offset 32
+        // Ghost-reduction (anti-crosstalk) levers, applied last in the shader.
+        // ghostContrast 1.0 and ghostBlackFloor 0.0 are exact no-ops and the
+        // shader skips the math for them. These two floats consume the tail
+        // padding the struct already had (40 bytes rounded up to 48), so the
+        // constant buffer size is unchanged.
+        float ghostContrast;      // offset 40
+        float ghostBlackFloor;    // offset 44 — closes the 48-byte chunk
     };
 #ifdef HLSL_CPU
 };
