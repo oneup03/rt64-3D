@@ -17,63 +17,65 @@ namespace RT64 {
         matrix[3][0] *= aspectRatioScale;
     }
 
-    // BanjoRecomp3D-specific transform IDs: see patches/transform_ids.h.
-    // The world (gameplay) projection receives full per-eye stereo: projection
+    // DK64-specific transform IDs: see patches/common_structs.h (interpolationIDs).
+    // The world (camera) projection receives full per-eye stereo: projection
     // off-axis (inter-eye disparity) + view translation (depth-dependent parallax).
-    // The skybox receives only the projection off-axis with no view shift, which
-    // gives it the maximum positive parallax of an object at infinity — exactly
-    // what we want so it sits well behind the world geometry.
-    // HUD/menu/cutscene-overlay projections (HUD, PRESS_START, BK_LOGO, COPYRIGHT,
-    // GAME_OVER, THE_END, TRANSITION, PILLARBOX, PORTRAITs) deliberately stay flat
-    // at the screen plane to remain readable.
-    static constexpr uint32_t BANJO_PROJECTION_GAMEPLAY_TRANSFORM_ID     = 0x00001000;
-    static constexpr uint32_t BANJO_PROJECTION_SKYBOX_TRANSFORM_ID       = 0x00001001;
-    static constexpr uint32_t BANJO_PROJECTION_TRANSITION_TRANSFORM_ID   = 0x00001002;
-    static constexpr uint32_t BANJO_PROJECTION_PRESS_START_TRANSFORM_ID  = 0x00001003;
-    static constexpr uint32_t BANJO_PROJECTION_HUD_TRANSFORM_ID          = 0x00001004;
-    static constexpr uint32_t BANJO_PROJECTION_BK_LOGO_TRANSFORM_ID      = 0x00001005;
-    static constexpr uint32_t BANJO_PROJECTION_COPYRIGHT_TRANSFORM_ID    = 0x00001006;
-    static constexpr uint32_t BANJO_PROJECTION_GAME_OVER_TRANSFORM_ID    = 0x00001007;
-    static constexpr uint32_t BANJO_PROJECTION_THE_END_TRANSFORM_ID      = 0x00001008;
-    static constexpr uint32_t BANJO_PROJECTION_PILLARBOX_TRANSFORM_ID    = 0x00001009;
-    static constexpr uint32_t BANJO_PROJECTION_DIALOG_BUBBLE_TRANSFORM_ID = 0x0000100A;
-    static constexpr uint32_t BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_START = 0x00001100;
-    static constexpr uint32_t BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_END   = 0x000011FF;
+    // The sky gradient receives only the projection off-axis with no view shift,
+    // which gives it the maximum positive parallax of an object at infinity —
+    // exactly what we want so it sits well behind the world geometry.
+    // HUD/menu/overlay projections stay flat near the screen plane to remain
+    // readable, at the user's configured HUD depth.
+    //
+    // ⚠ DK64 does NOT use Banjo's 0x1000-block projection IDs. 0x1000 here is
+    // MTXTAG_ACTORS (0x100 IDs allocated per actor, so 0x1000..0x100FFF), and
+    // matching it as the world projection would give every actor in the game
+    // the camera's per-eye treatment. The IDs below are DK64's own, and the
+    // HUD range is new space carved out below MTXTAG_MAINMENU_BARREL (0xF00).
+    //
+    // Occupied elsewhere in DK64's ID space, do not reuse: 0x000-0x005 (the
+    // low enum tags), 0xF00 (main-menu barrel), 0x1000+ (actors), 0x101000+
+    // (props), 0x102000+ (sprites), 0x200000+ (text), 0x400000+ (fluids,
+    // solar flare, rap lyrics).
+    static constexpr uint32_t DK64_MTXTAG_FRAMEBUFFERTRANSITION = 0x00000002;
+    static constexpr uint32_t DK64_MTXTAG_SKYBOXBLEND           = 0x00000004;
+    static constexpr uint32_t DK64_MTXTAG_CAMERAPROJECTION      = 0x00000005;
+
+    // HUD projections are matched as a RANGE rather than one constant per
+    // element, so the recompilation patches can add new HUD projection sites
+    // without a matching edit over here. The upper half of the range is for
+    // perspective HUD elements that need to land at the same depth as the
+    // orthographic text drawn alongside them (Banjo's "dialog bubble" case).
+    static constexpr uint32_t DK64_PROJECTION_HUD_ID_START      = 0x00000600;
+    static constexpr uint32_t DK64_PROJECTION_HUD_ID_END        = 0x0000067F;
+    static constexpr uint32_t DK64_PROJECTION_HUD_MATCHORTHO_ID_START = 0x00000680;
+    static constexpr uint32_t DK64_PROJECTION_HUD_MATCHORTHO_ID_END   = 0x000006FF;
 
     static bool isStereoProjectionId(uint32_t matrixId) {
-        return (matrixId == BANJO_PROJECTION_GAMEPLAY_TRANSFORM_ID) ||
-               (matrixId == BANJO_PROJECTION_SKYBOX_TRANSFORM_ID);
+        return (matrixId == DK64_MTXTAG_CAMERAPROJECTION) ||
+               (matrixId == DK64_MTXTAG_SKYBOXBLEND);
     }
 
     static bool isStereoViewShiftProjectionId(uint32_t matrixId) {
-        return (matrixId == BANJO_PROJECTION_GAMEPLAY_TRANSFORM_ID);
+        return (matrixId == DK64_MTXTAG_CAMERAPROJECTION);
     }
 
-    // HUD / dialog / text / cutscene-overlay projections that should receive
-    // the user's configured constant stereo depth (no view shift). The pillarbox
-    // is intentionally excluded because it's a screen-edge mask and looks weird
-    // if it moves out of plane. The transition fade is also excluded for the
-    // same reason.
+    // HUD / menu / overlay projections that should receive the user's
+    // configured constant stereo depth (no view shift). The framebuffer
+    // transition is deliberately excluded: it's a full-screen fade and looks
+    // wrong if it moves out of plane, the same reason Banjo excludes its
+    // pillarbox and transition tags.
     static bool isStereoHudProjectionId(uint32_t matrixId) {
-        if (matrixId == BANJO_PROJECTION_HUD_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_PRESS_START_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_BK_LOGO_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_COPYRIGHT_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_GAME_OVER_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_THE_END_TRANSFORM_ID) return true;
-        if (matrixId == BANJO_PROJECTION_DIALOG_BUBBLE_TRANSFORM_ID) return true;
-        if ((matrixId >= BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_START) &&
-            (matrixId <= BANJO_PROJECTION_PORTRAIT_TRANSFORM_ID_END)) return true;
-        return false;
+        if (matrixId == DK64_MTXTAG_FRAMEBUFFERTRANSITION) return false;
+        return ((matrixId >= DK64_PROJECTION_HUD_ID_START) &&
+                (matrixId <= DK64_PROJECTION_HUD_MATCHORTHO_ID_END));
     }
 
-    // The dialog bubble specifically needs a stronger HUD shift than the
-    // default perspective-HUD path provides, so it lands at the same depth as
-    // the text rectangles drawn alongside it. Other perspective-HUD elements
-    // (press-start logo, BK title logo, etc.) keep the original P[0][0]-based
-    // shift so we don't alter behavior the user already signed off on.
+    // Perspective HUD elements that need a stronger shift than the default
+    // perspective-HUD path provides, so they land at the same depth as the
+    // orthographic text rectangles drawn alongside them.
     static bool isStereoBubbleProjectionId(uint32_t matrixId) {
-        return (matrixId == BANJO_PROJECTION_DIALOG_BUBBLE_TRANSFORM_ID);
+        return ((matrixId >= DK64_PROJECTION_HUD_MATCHORTHO_ID_START) &&
+                (matrixId <= DK64_PROJECTION_HUD_MATCHORTHO_ID_END));
     }
 
     // dynamic3d 1.3 - the clip-space stereo parameterization.
@@ -120,13 +122,27 @@ namespace RT64 {
         return static_cast<float>(convergenceTenths) * 2.0f;
     }
 
-    // BK's horizontal projection scale at the aspect ratio the HUD constants
-    // below were tuned at. The game builds every perspective projection from
-    // one guPerspective call at a fixed 40-degree vertical FoV over the VI's
-    // 4:3 source, and RT64 then narrows m[0][0] by 1/aspectRatioScale for
-    // widescreen, so at 16:9 this is 1 / ((16/9) * tan(20 deg)). Used in place
-    // of the live m[0][0] so HUD depth stops tracking the output aspect ratio.
-    static constexpr float ReferenceProjectionScale = 1.5455f;
+    // DK64's horizontal projection scale at the aspect ratio the HUD constants
+    // below were tuned at (16:9). Used in place of the live m[0][0] so HUD
+    // depth stops tracking the output aspect ratio.
+    //
+    // Derived, not measured by eye:
+    //   fovy         = 45.0    (D_global_asm_807444B8, global_asm .data)
+    //   game aspect  = 1.0     (func_global_asm_8062A850() * D_global_asm_807444BC;
+    //                           the FoV multiplier is 1.0 because widescreen_enabled
+    //                           defaults to 0 and the recomp leaves it there - RT64
+    //                           does the widescreen expansion instead)
+    //   guPerspectiveF sets m[0][0] = cot(fovy/2) / aspect = 2.414214 / 1.0
+    //   RT64 then scales it by 1/aspectRatioScale a few lines below, and in
+    //   Expand mode aspectRatioScale = output_aspect / (4/3), i.e. 1.33333 at 16:9
+    //   => 2.414214 / 1.33333 = 1.81066
+    //
+    // Unlike BK, DK64's FoV is a variable rather than a compile-time constant, so
+    // this is the value at the *default* camera. It is deliberately frozen: the
+    // live m[0][0] would make HUD depth track both the window shape and any in-game
+    // FoV change. If the game's own widescreen_enabled is ever turned on, the
+    // equivalent constant becomes 1.50888.
+    static constexpr float ReferenceProjectionScale = 1.81066f;
 
     // dynamic3d 1.1 - the shear is the knob.
     //
