@@ -10,6 +10,14 @@
 #include "rt64_buffer_uploader.h"
 
 namespace RT64 {
+    // The world projection's depth terms (m[2][2], m[3][2]), published each
+    // frame by the projection processor so the depth sampler can turn a device
+    // depth into a view-space distance using the projection actually in use
+    // rather than assuming DK64's nominal near/far. Returns false until a world
+    // projection has been seen.
+    void stereoPublishWorldDepthTerms(float m22, float m32);
+    bool stereoGetWorldDepthTerms(float &m22, float &m32);
+
     enum class StereoEye {
         None,
         Left,

@@ -135,6 +135,28 @@ namespace RT64 {
         // math entirely when they're both there.
         uint32_t stereoGhostContrast;
         uint32_t stereoGhostBlackFloor;
+        // Non-zero while the user's Auto Convergence toggle is on. Pushed from
+        // the host each frame rather than serialised: the saved state lives in
+        // the game's own config, and this is only the renderer's copy of it.
+        // The depth-driven convergence loop is gated on this.
+        uint32_t stereoAutoConvergence;
+        // The user's convergence slider BEFORE the game's scene classification
+        // scales it. The depth-driven loop needs this as its ceiling: feeding it
+        // the scaled value made the ceiling flicker between the two whenever a
+        // cutscene or menu toggled the classification, and the loop chased it.
+        uint32_t stereoConvergenceManual;
+        // Comfort budget for the depth-driven convergence loop, in thousandths
+        // of screen width of permitted pop-out. SIGNED: 0 puts the screen plane
+        // exactly on the nearest object, and negative values pull it in FRONT of
+        // the nearest object so the whole scene sits behind the screen - the
+        // most conservative stereo there is, and what some viewers prefer.
+        int32_t stereoComfortTarget;
+        // Set while the game reports the current scene as one that frames things
+        // close - cutscenes, menus, minigames. The depth loop tightens its
+        // comfort budget here rather than being replaced by it: cutscenes cut
+        // hard, and the loop's smoothing needs several frames to settle after
+        // each cut, which is exactly when a close framing reads worst.
+        uint32_t stereoSceneLowConvergence;
 
         UserConfiguration();
         void validate();

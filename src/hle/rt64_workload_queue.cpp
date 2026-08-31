@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <atomic>
 #include <cstdarg>
 #include <cstdlib>
 
@@ -23,21 +24,25 @@ namespace RT64 {
     // evaluated against DK64's near/far (10 / 1500). dynamic3d 4.1 warns not to
     // assume which convention a renderer uses, so this reports both and lets a
     // known-distance observation pick the right one. Remove once calibrated.
-    // ⚠ OFF by default because this currently CRASHES (access violation on the
-    // first frame with a depth target). The copy and its barriers are issued
-    // from inside the framebuffer loop, where a render pass is still active,
-    // and recording a texture copy there is not legal. It needs a hook point
-    // outside the pass before it can be turned back on. Set
-    // DK64_STEREO_DEPTH_SAMPLE=1 to work on it.
+    // Depth readback for the depth-aware stereo features. On by default now
+    // that the crash is fixed; set DK64_STEREO_DEPTH_SAMPLE=0 to turn it off.
     //
-    // Note the earlier opt-in variable also silently hid the fact that this
-    // code had never executed at all - an empty log looked identical to a
-    // disabled one, which cost two rounds of debugging. Hence the explicit
-    // "sampling active" heartbeat in logStereoDepthSample.
+    // The crash was not what it looked like. The copy is issued from inside the
+    // framebuffer loop, which looked like recording a texture copy during an
+    // active render pass, but plume's copyTextureRegion ends the pass itself.
+    // The real cause was that plume's VULKAN backend only implemented
+    // buffer -> image copies: every other combination fell through to a generic
+    // branch that dereferences the destination texture, which is null when the
+    // destination is a buffer. D3D12 was fine throughout. The missing
+    // image -> buffer path is now implemented in plume_vulkan.cpp.
+    //
+    // An earlier opt-IN variable also hid the fact that this code had never
+    // executed at all - an empty log looked identical to a disabled one - hence
+    // the explicit "sampling active" heartbeat in logStereoDepthSample.
     static bool stereoDepthSamplingEnabled() {
         static const bool enabled = [] {
             const char *v = std::getenv("DK64_STEREO_DEPTH_SAMPLE");
-            return (v != nullptr) && (v[0] != 0) && (v[0] != '0');
+            return (v == nullptr) || ((v[0] != 0) && (v[0] != '0'));
         }();
         return enabled;
     }
@@ -47,7 +52,7 @@ namespace RT64 {
     // which is not always where you expect.
     static void stereoDepthLogLine(const char *fmt, ...) {
         static uint32_t linesWritten = 0;
-        if (linesWritten >= 400) {
+        if (linesWritten >= 4000) {
             return;
         }
         linesWritten++;
@@ -66,19 +71,61 @@ namespace RT64 {
         }
     }
 
-    static void logStereoDepthSample(float deviceDepth) {
-        // Report that sampling is running even while it has nothing valid to
-        // say, so an empty log unambiguously means "never ran" rather than
-        // "ran and found nothing". Without this the two are indistinguishable.
-        static uint32_t invalidRun = 0;
-        if (deviceDepth <= 0.0f) {
-            invalidRun++;
-            if ((invalidRun == 1) || (invalidRun == 300) || (invalidRun == 3000)) {
-                stereoDepthLogLine("(sampling active, no valid depth yet: %u frames)", invalidRun);
-            }
+    // Convergence the depth loop wants, in tenths of a slider unit, or 0 when it
+    // has nothing to say and the user's manual value should stand. Written on
+    // the render thread where the depth is sampled and read a few lines earlier
+    // in the same loop on the following frame, hence the atomic.
+    static std::atomic<uint32_t> stereoAutoConvergenceTenths{0};
+
+    static void logStereoAutoConvergence(float nearestZ, uint32_t manualTenths, uint32_t appliedTenths) {
+        static uint32_t lastLogged = UINT32_MAX;
+        // Only on a real change, so a steady scene stays quiet.
+        if (appliedTenths == lastLogged) {
             return;
         }
-        invalidRun = 0;
+        lastLogged = appliedTenths;
+        stereoDepthLogLine("autoconv: nearestZ=%.1f manual=%.1f applied=%.1f",
+            nearestZ, manualTenths * 0.1f, appliedTenths * 0.1f);
+    }
+
+    // Reports the first few depth targets offered for sampling and whether the
+    // size gate accepted them. Without this, "no output at all" is ambiguous
+    // between the gate rejecting everything and the readback returning nothing.
+    static void logStereoDepthCandidate(uint32_t depthW, uint32_t depthH,
+                                        uint32_t colorW, uint32_t colorH, bool accepted) {
+        static uint32_t reported = 0;
+        if (reported >= 8) {
+            return;
+        }
+        reported++;
+        stereoDepthLogLine("(candidate depth %ux%u vs colour %ux%u -> %s)",
+            depthW, depthH, colorW, colorH, accepted ? "sampled" : "skipped");
+    }
+
+    static void logStereoDepthSample(float deviceDepth) {
+        // A periodic summary rather than a per-frame heartbeat. The first
+        // version logged on every invalid frame, and because valid and invalid
+        // samples alternated it consumed the whole line budget in seconds and
+        // silenced the log - which read as "no depth data" while sampling was
+        // in fact working. A summary keeps "sampling is running" distinguishable
+        // from "sampling is disabled" without drowning the useful lines.
+        static uint32_t sampled = 0;
+        static uint32_t validCount = 0;
+        static float lastValid = -1.0f;
+
+        sampled++;
+        if (deviceDepth > 0.0f) {
+            validCount++;
+            lastValid = deviceDepth;
+        }
+
+        if ((sampled % 600) == 0) {
+            stereoDepthLogLine("(status: %u sampled, %u valid, last=%.6f)", sampled, validCount, lastValid);
+        }
+
+        if (deviceDepth <= 0.0f) {
+            return;
+        }
 
         // Only log on a meaningful change, so walking around produces a
         // readable trace instead of 60 identical lines a second.
@@ -88,15 +135,24 @@ namespace RT64 {
         }
         lastLogged = deviceDepth;
 
+        // Linear view-space distance, assuming DK64's near/far (10 / 1500 read
+        // from global_asm .data) and a standard [0,1] depth range.
+        //
+        // An earlier version of this printed two columns, labelled as the "GL"
+        // and "D3D" depth conventions, on the theory that comparing them against
+        // a known distance would reveal which one the backend uses. They are the
+        // same function:
+        //     2nf / ((f+n) - (2d-1)(f-n))
+        // has denominator 2(f - d(f-n)), so it reduces to nf / (f - d(f-n)).
+        // The two columns agreed in every sample because they could not disagree.
+        // Distinguishing a standard from a reversed depth range needs a
+        // known-distance observation, not a second algebraic form.
         constexpr float nearZ = 10.0f;
         constexpr float farZ = 1500.0f;
-        const float ndc = (2.0f * deviceDepth) - 1.0f;
-        const float glDenom = (farZ + nearZ) - (ndc * (farZ - nearZ));
-        const float d3dDenom = farZ - (deviceDepth * (farZ - nearZ));
-        const float glZ = (std::fabs(glDenom) > 1e-6f) ? ((2.0f * nearZ * farZ) / glDenom) : -1.0f;
-        const float d3dZ = (std::fabs(d3dDenom) > 1e-6f) ? ((nearZ * farZ) / d3dDenom) : -1.0f;
+        const float denom = farZ - (deviceDepth * (farZ - nearZ));
+        const float viewZ = (std::fabs(denom) > 1e-6f) ? ((nearZ * farZ) / denom) : -1.0f;
 
-        stereoDepthLogLine("device=%.6f  asGL=%.1f  asD3D=%.1f", deviceDepth, glZ, d3dZ);
+        stereoDepthLogLine("device=%.6f  viewZ=%.1f", deviceDepth, viewZ);
     }
 
     // WorkloadQueue
@@ -408,6 +464,17 @@ namespace RT64 {
             projParams.stereoMode = stereoMode;
             projParams.stereoSeparation = ext.sharedResources->userConfig.stereoSeparation;
             projParams.stereoConvergence = ext.sharedResources->userConfig.stereoConvergence;
+
+            // Depth-driven auto-convergence overrides the manual value when it
+            // has something to say. It only ever pulls convergence IN - the
+            // manual slider stays the ceiling - so this cannot push the screen
+            // plane further out than the user asked for.
+            if (ext.sharedResources->userConfig.stereoAutoConvergence != 0) {
+                const uint32_t autoTenths = stereoAutoConvergenceTenths.load(std::memory_order_relaxed);
+                if (autoTenths > 0) {
+                    projParams.stereoConvergence = std::min(autoTenths, projParams.stereoConvergence);
+                }
+            }
             projParams.stereoHudDepth = ext.sharedResources->userConfig.stereoHudDepth;
             // Caller selects which eye this pass renders. The two-pass driver in
             // renderThreadLoop runs this function twice with Left then Right when
@@ -928,10 +995,70 @@ namespace RT64 {
 
                     // Depth sampling for the depth-aware stereo features
                     // (dynamic3d 4.1 / 5.1). Render-thread only, so no locking.
-                    if ((depthTarget != nullptr) && stereoDepthSamplingEnabled()) {
-                        static StereoDepthSampler stereoDepthSampler;
-                        stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget);
-                        logStereoDepthSample(stereoDepthSampler.fetchMedianDeviceDepth());
+                    //
+                    // This loop runs once per framebuffer pair and a frame has
+                    // several. Only the world pass carries usable centre depth;
+                    // the smaller auxiliary passes are empty there, so sampling
+                    // every pair produced a stream that was invalid most of the
+                    // time. Require the depth target to match the colour target's
+                    // size, and let the sampler take only the first such pass per
+                    // frame - reading back only when it actually sampled.
+                    if (stereoDepthSamplingEnabled()) {
+                        // Auxiliary passes are much smaller than the world pass;
+                        // half the colour target's dimensions separates them
+                        // without needing an exact match.
+                        //
+                        // Only the left eye is sampled. In stereo the world is
+                        // rendered twice and both passes produce a full-size
+                        // depth target, so taking both interleaved two series
+                        // that differ by the eye disparity - enough to make
+                        // anything driven from this jitter every frame.
+                        const bool sampledEye = (stereoEye != StereoEye::Right);
+                        const bool mainPass = sampledEye && (depthTarget != nullptr) &&
+                            ((colorTarget == nullptr) ||
+                             ((depthTarget->width * 2 >= colorTarget->width) &&
+                              (depthTarget->height * 2 >= colorTarget->height)));
+                        // Logged even when there is no depth target, so "no
+                        // output" cannot be confused with "never reached".
+                        logStereoDepthCandidate((depthTarget != nullptr) ? depthTarget->width : 0,
+                            (depthTarget != nullptr) ? depthTarget->height : 0,
+                            (colorTarget != nullptr) ? colorTarget->width : 0,
+                            (colorTarget != nullptr) ? colorTarget->height : 0, mainPass);
+                        if (mainPass) {
+                            static StereoDepthSampler stereoDepthSampler;
+                            static StereoAutoConvergence stereoAutoConvergence;
+                            if (stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget)) {
+                                const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
+                                logStereoDepthSample(sample.valid ? sample.medianDeviceDepth : -1.0f);
+
+                                // Invert the sampled depth with the projection
+                                // the frame was actually rendered with, rather
+                                // than assuming DK64's nominal near/far.
+                                float projM22 = 0.0f;
+                                float projM32 = 0.0f;
+                                const auto &cfg = ext.sharedResources->userConfig;
+                                if (sample.valid && (cfg.stereoAutoConvergence != 0) &&
+                                    stereoGetWorldDepthTerms(projM22, projM32)) {
+                                    const float nearestZ = stereoDeviceDepthToViewZ(sample.nearestDeviceDepth, projM22, projM32);
+                                    // Ceiling is the user's UNSCALED slider. Using
+                                    // the effective value made the ceiling flicker
+                                    // as the game's scene classification toggled,
+                                    // and the loop chased it instead of the scene.
+                                    stereoAutoConvergenceTenths.store(
+                                        stereoAutoConvergence.update(nearestZ, cfg.stereoConvergenceManual, cfg.stereoSeparation,
+                                            cfg.stereoComfortTarget, cfg.stereoSceneLowConvergence != 0),
+                                        std::memory_order_relaxed);
+                                    logStereoAutoConvergence(nearestZ, cfg.stereoConvergenceManual,
+                                        stereoAutoConvergenceTenths.load(std::memory_order_relaxed));
+                                }
+                                else if (cfg.stereoAutoConvergence == 0) {
+                                    // Snap back rather than easing out, so turning
+                                    // the feature off is immediate.
+                                    stereoAutoConvergence.reset();
+                                    stereoAutoConvergenceTenths.store(0, std::memory_order_relaxed);
+                                }
+                            }
+                        }
                     }
 
                     // Do the resolve if using MSAA while target override is active and we're on the correct framebuffer pair index.

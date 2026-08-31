@@ -5,6 +5,8 @@
 #include "rt64_projection_processor.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +18,30 @@
 #include "hle/rt64_workload_queue.h"
 
 namespace RT64 {
+    static std::atomic<uint32_t> worldDepthM22Bits{0};
+    static std::atomic<uint32_t> worldDepthM32Bits{0};
+    static std::atomic<bool> worldDepthTermsValid{false};
+
+    void stereoPublishWorldDepthTerms(float m22, float m32) {
+        uint32_t bits22, bits32;
+        std::memcpy(&bits22, &m22, sizeof(bits22));
+        std::memcpy(&bits32, &m32, sizeof(bits32));
+        worldDepthM22Bits.store(bits22, std::memory_order_relaxed);
+        worldDepthM32Bits.store(bits32, std::memory_order_relaxed);
+        worldDepthTermsValid.store(true, std::memory_order_relaxed);
+    }
+
+    bool stereoGetWorldDepthTerms(float &m22, float &m32) {
+        if (!worldDepthTermsValid.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        const uint32_t bits22 = worldDepthM22Bits.load(std::memory_order_relaxed);
+        const uint32_t bits32 = worldDepthM32Bits.load(std::memory_order_relaxed);
+        std::memcpy(&m22, &bits22, sizeof(m22));
+        std::memcpy(&m32, &bits32, sizeof(m32));
+        return true;
+    }
+
     inline void adjustProjectionMatrix(interop::float4x4 &matrix, const float aspectRatioScale) {
         matrix[0][0] *= aspectRatioScale;
         matrix[1][0] *= aspectRatioScale;
@@ -571,6 +597,13 @@ namespace RT64 {
                 (proj.type == Projection::Type::Perspective) &&
                 isStereoProjectionId(curProjGroup.matrixId)) {
                 applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation);
+
+                // Publish this projection's depth terms for the depth sampler.
+                // The world projection is the one the sampled depth buffer was
+                // rendered with, so these are the right terms to invert it.
+                if (isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
+                    stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2]);
+                }
             }
 
             // Place at-infinity content (the sun and its lens flare) at maximum
