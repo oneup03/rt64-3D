@@ -1660,7 +1660,27 @@ namespace RT64 {
                             // rectangles. This makes screen-space text/UI
                             // shift in lockstep with the rest of the HUD when
                             // the HUD Depth slider is moved in stereo mode.
-                            triangles.screenOffset.x += p.stereoRectOffsetX;
+                            //
+                            // A rectangle that spans the ENTIRE scissor is a
+                            // full-screen effect rather than HUD content -
+                            // DK64's underwater tint and sun glare are exactly
+                            // this: gDPFillRectangle with a blended primitive
+                            // colour over the whole screen. Those must stay
+                            // welded to the screen plane; shifting them reads as
+                            // a coloured sheet floating in front of the world.
+                            //
+                            // This is the only layer that can tell them apart.
+                            // gDPFillRectangle is a raster-space operation that
+                            // never goes through a projection matrix, so the
+                            // projection-based HUD classification never sees it,
+                            // and the tints arrive under the same tag and matrix
+                            // as the HUD there.
+                            const bool coversScissorHeight = regularOrigins &&
+                                (call.callDesc.rect.uly <= fbPair.scissorRect.uly) &&
+                                (call.callDesc.rect.lry >= fbPair.scissorRect.lry);
+                            if (!(coversScissorWidth && coversScissorHeight)) {
+                                triangles.screenOffset.x += p.stereoRectOffsetX;
+                            }
 
                             if (p.postBlendNoise) {
                                 // Indicate if post blend dither noise should be applied.

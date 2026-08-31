@@ -7,10 +7,98 @@
 #include "common/rt64_thread.h"
 
 #include "rt64_present_queue.h"
+#include "render/rt64_stereo_depth_sampler.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdlib>
 
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
 
 namespace RT64 {
+    // Temporary stereo depth bring-up instrumentation. DK64_STEREO_DEPTH_LOG=1
+    // enables the readback and writes the sampled centre depth to
+    // stereo_depth.log, alongside both candidate device-depth conventions
+    // evaluated against DK64's near/far (10 / 1500). dynamic3d 4.1 warns not to
+    // assume which convention a renderer uses, so this reports both and lets a
+    // known-distance observation pick the right one. Remove once calibrated.
+    // ⚠ OFF by default because this currently CRASHES (access violation on the
+    // first frame with a depth target). The copy and its barriers are issued
+    // from inside the framebuffer loop, where a render pass is still active,
+    // and recording a texture copy there is not legal. It needs a hook point
+    // outside the pass before it can be turned back on. Set
+    // DK64_STEREO_DEPTH_SAMPLE=1 to work on it.
+    //
+    // Note the earlier opt-in variable also silently hid the fact that this
+    // code had never executed at all - an empty log looked identical to a
+    // disabled one, which cost two rounds of debugging. Hence the explicit
+    // "sampling active" heartbeat in logStereoDepthSample.
+    static bool stereoDepthSamplingEnabled() {
+        static const bool enabled = [] {
+            const char *v = std::getenv("DK64_STEREO_DEPTH_SAMPLE");
+            return (v != nullptr) && (v[0] != 0) && (v[0] != '0');
+        }();
+        return enabled;
+    }
+
+    // Writes to both the log file and stderr. The console copy matters because
+    // the file lands in whatever the process's working directory happens to be,
+    // which is not always where you expect.
+    static void stereoDepthLogLine(const char *fmt, ...) {
+        static uint32_t linesWritten = 0;
+        if (linesWritten >= 400) {
+            return;
+        }
+        linesWritten++;
+
+        char buf[256];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+
+        fprintf(stderr, "[stereo-depth] %s\n", buf);
+        FILE *f = fopen("stereo_depth.log", "a");
+        if (f != nullptr) {
+            fprintf(f, "%s\n", buf);
+            fclose(f);
+        }
+    }
+
+    static void logStereoDepthSample(float deviceDepth) {
+        // Report that sampling is running even while it has nothing valid to
+        // say, so an empty log unambiguously means "never ran" rather than
+        // "ran and found nothing". Without this the two are indistinguishable.
+        static uint32_t invalidRun = 0;
+        if (deviceDepth <= 0.0f) {
+            invalidRun++;
+            if ((invalidRun == 1) || (invalidRun == 300) || (invalidRun == 3000)) {
+                stereoDepthLogLine("(sampling active, no valid depth yet: %u frames)", invalidRun);
+            }
+            return;
+        }
+        invalidRun = 0;
+
+        // Only log on a meaningful change, so walking around produces a
+        // readable trace instead of 60 identical lines a second.
+        static float lastLogged = -1.0f;
+        if ((lastLogged > 0.0f) && (std::fabs(deviceDepth - lastLogged) < (lastLogged * 0.02f))) {
+            return;
+        }
+        lastLogged = deviceDepth;
+
+        constexpr float nearZ = 10.0f;
+        constexpr float farZ = 1500.0f;
+        const float ndc = (2.0f * deviceDepth) - 1.0f;
+        const float glDenom = (farZ + nearZ) - (ndc * (farZ - nearZ));
+        const float d3dDenom = farZ - (deviceDepth * (farZ - nearZ));
+        const float glZ = (std::fabs(glDenom) > 1e-6f) ? ((2.0f * nearZ * farZ) / glDenom) : -1.0f;
+        const float d3dZ = (std::fabs(d3dDenom) > 1e-6f) ? ((nearZ * farZ) / d3dDenom) : -1.0f;
+
+        stereoDepthLogLine("device=%.6f  asGL=%.1f  asD3D=%.1f", deviceDepth, glZ, d3dZ);
+    }
+
     // WorkloadQueue
 
     WorkloadQueue::WorkloadQueue() {
@@ -836,6 +924,14 @@ namespace RT64 {
                     else {
                         RenderTarget *chosenTarget = (colorTarget != nullptr) ? colorTarget : depthTarget;
                         ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(chosenTarget->texture.get(), RenderTextureLayout::SHADER_READ));
+                    }
+
+                    // Depth sampling for the depth-aware stereo features
+                    // (dynamic3d 4.1 / 5.1). Render-thread only, so no locking.
+                    if ((depthTarget != nullptr) && stereoDepthSamplingEnabled()) {
+                        static StereoDepthSampler stereoDepthSampler;
+                        stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget);
+                        logStereoDepthSample(stereoDepthSampler.fetchMedianDeviceDepth());
                     }
 
                     // Do the resolve if using MSAA while target override is active and we're on the correct framebuffer pair index.

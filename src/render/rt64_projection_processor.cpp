@@ -5,6 +5,12 @@
 #include "rt64_projection_processor.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 #include "common/rt64_math.h"
 #include "hle/rt64_workload_queue.h"
@@ -20,11 +26,11 @@ namespace RT64 {
     // DK64-specific transform IDs: see patches/common_structs.h (interpolationIDs).
     // The world (camera) projection receives full per-eye stereo: projection
     // off-axis (inter-eye disparity) + view translation (depth-dependent parallax).
-    // The sky gradient receives only the projection off-axis with no view shift,
-    // which gives it the maximum positive parallax of an object at infinity —
-    // exactly what we want so it sits well behind the world geometry.
-    // HUD/menu/overlay projections stay flat near the screen plane to remain
-    // readable, at the user's configured HUD depth.
+    // The sky gradient shares the world's treatment rather than sitting at
+    // infinity - see isStereoViewShiftProjectionId for why.
+    // HUD/menu/overlay content is ORTHOGRAPHIC in DK64 and carries the world's
+    // tag, so it is classified by projection type rather than by ID - see
+    // isStereoHudTarget.
     //
     // ⚠ DK64 does NOT use Banjo's 0x1000-block projection IDs. 0x1000 here is
     // MTXTAG_ACTORS (0x100 IDs allocated per actor, so 0x1000..0x100FFF), and
@@ -50,24 +56,166 @@ namespace RT64 {
     static constexpr uint32_t DK64_PROJECTION_HUD_MATCHORTHO_ID_START = 0x00000680;
     static constexpr uint32_t DK64_PROJECTION_HUD_MATCHORTHO_ID_END   = 0x000006FF;
 
+    // MTXTAG_PROJ_AT_INFINITY in patches/common_structs.h - the sun and its lens
+    // flare, tagged at their draw site in patches/patches_matrix.c. They are
+    // screen-space elements standing in for something infinitely far away, so
+    // they belong at maximum positive parallax rather than on the screen plane.
+    static constexpr uint32_t DK64_PROJECTION_AT_INFINITY_ID    = 0x00000700;
+
+    static bool isStereoInfinityProjectionId(uint32_t matrixId) {
+        return (matrixId == DK64_PROJECTION_AT_INFINITY_ID);
+    }
+
+    // Temporary stereo bring-up instrumentation. Set DK64_STEREO_PROJ_LOG=1 to
+    // append every distinct (matrixId, projection type) pair the frame graph
+    // produces to stereo_proj.log, together with how the stereo classifier
+    // treats it. Remove once the transform-ID map is settled.
+    // DK64 builds several different orthographic projections per frame (a 1x
+    // screen-space one, a 2x, a 4x used for text precision, and a
+    // character-select one) and they ALL carry the same matrixId, so keying the
+    // dedup on the id alone collapses them into a single line. Including the
+    // projection's own scale separates them, which is what lets a full-screen
+    // effect quad be told apart from HUD content drawn under the same tag.
+    static void logStereoProjectionId(uint32_t matrixId, bool isPerspective, float scaleX, float scaleY,
+                                      bool getsShear, bool getsViewShift, bool getsHudDepth) {
+        // Bring-up default is ON; set DK64_STEREO_PROJ_LOG=0 to silence it. The
+        // output is deduplicated, so it stays a handful of lines per session.
+        static const bool enabled = [] {
+            const char *v = std::getenv("DK64_STEREO_PROJ_LOG");
+            return (v == nullptr) || ((v[0] != '\0') && (v[0] != '0'));
+        }();
+        if (!enabled) {
+            return;
+        }
+
+        // Key on everything we print, so a given ID is reported once per
+        // distinct classification rather than once ever - that way an ID whose
+        // treatment changes between areas still shows up.
+        // Quantise the scales so floating-point noise doesn't emit a new line
+        // every frame for what is really the same projection.
+        const int scaleKeyX = int(scaleX * 10000.0f);
+        const int scaleKeyY = int(scaleY * 10000.0f);
+        using Key = std::tuple<uint32_t, bool, int, int, bool, bool, bool>;
+        static std::mutex mutex;
+        static std::set<Key> seen;
+        const Key key{matrixId, isPerspective, scaleKeyX, scaleKeyY, getsShear, getsViewShift, getsHudDepth};
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!seen.insert(key).second) {
+            return;
+        }
+
+        FILE *f = fopen("stereo_proj.log", "a");
+        if (f == nullptr) {
+            return;
+        }
+        // For an orthographic projection m[0][0] is 2/(right-left), so the
+        // implied width in game units is 2/scaleX - a directly readable way to
+        // tell a 320-wide screen quad from a 1280-wide text projection.
+        const float impliedW = (scaleX != 0.0f) ? (2.0f / scaleX) : 0.0f;
+        const float impliedH = (scaleY != 0.0f) ? (2.0f / scaleY) : 0.0f;
+        fprintf(f, "matrixId=0x%08X %-13s scale=(%.5f,%.5f) implied=(%.1fx%.1f) shear=%d viewShift=%d hudDepth=%d\n",
+            matrixId, isPerspective ? "perspective" : "orthographic",
+            scaleX, scaleY, impliedW, impliedH,
+            getsShear ? 1 : 0, getsViewShift ? 1 : 0, getsHudDepth ? 1 : 0);
+        fclose(f);
+    }
+
     static bool isStereoProjectionId(uint32_t matrixId) {
         return (matrixId == DK64_MTXTAG_CAMERAPROJECTION) ||
                (matrixId == DK64_MTXTAG_SKYBOXBLEND);
     }
 
+    // Which projections get the view-space eye baseline, i.e. depth-dependent
+    // parallax. This is the ONLY place convergence acts, so anything excluded
+    // here renders at a single flat depth that the convergence slider cannot
+    // move.
+    //
+    // MTXTAG_SKYBOXBLEND is included even though Banjo excludes its skybox
+    // equivalent, because in DK64 that tag is not exclusively the sky. The sky
+    // gradient functions (func_global_asm_80704B20 / func_global_asm_807069A4
+    // in patches/patches_framebuffer.c) *end* by emitting a SKYBOXBLEND
+    // projection group and never restore the camera group, so in outdoor maps
+    // every piece of world geometry drawn afterwards inherits it. Excluding it
+    // gave the whole outdoor hub the at-infinity treatment: uniform disparity,
+    // and convergence doing nothing.
+    //
+    // Since the two share a tag they must share a treatment, and world is the
+    // correct one - DK64 draws its sky as real geometry at a finite distance
+    // rather than a true infinite skybox, so parallax on it is not wrong. The
+    // proper fix, if the sky ever needs to sit at infinity again, is on the
+    // patch side: give the sky its own ID and re-tag the camera projection
+    // after it, rather than reintroducing the split here.
     static bool isStereoViewShiftProjectionId(uint32_t matrixId) {
-        return (matrixId == DK64_MTXTAG_CAMERAPROJECTION);
+        return (matrixId == DK64_MTXTAG_CAMERAPROJECTION) ||
+               (matrixId == DK64_MTXTAG_SKYBOXBLEND);
     }
 
-    // HUD / menu / overlay projections that should receive the user's
-    // configured constant stereo depth (no view shift). The framebuffer
-    // transition is deliberately excluded: it's a full-screen fade and looks
-    // wrong if it moves out of plane, the same reason Banjo excludes its
-    // pillarbox and transition tags.
+    // Full-screen effect overlays that must stay welded to the screen plane.
+    //
+    // These are ORTHOGRAPHIC draws that cover the whole viewport - screen wipes
+    // under the transition tag, and the sky blend, fog and underwater tint under
+    // the skybox tag (both emitted by func_global_asm_80704B20 /
+    // func_global_asm_807069A4 in patches/patches_framebuffer.c, which build a
+    // full-screen quad rather than 2D content). They are part of the picture
+    // rather than something laid on top of it, so moving them off-plane reads as
+    // a coloured sheet floating in front of or behind the world.
+    //
+    // Note this only applies to the ORTHOGRAPHIC use of the skybox tag; the
+    // perspective use is the sky geometry itself and keeps the world treatment.
+    static bool isStereoScreenOverlayId(uint32_t matrixId) {
+        return (matrixId == DK64_MTXTAG_FRAMEBUFFERTRANSITION) ||
+               (matrixId == DK64_MTXTAG_SKYBOXBLEND);
+    }
+
+    // Perspective-only HUD IDs, for menus or overlays the game draws in 3D.
+    // Orthographic content does not go through here - see isStereoHudTarget.
     static bool isStereoHudProjectionId(uint32_t matrixId) {
-        if (matrixId == DK64_MTXTAG_FRAMEBUFFERTRANSITION) return false;
         return ((matrixId >= DK64_PROJECTION_HUD_ID_START) &&
                 (matrixId <= DK64_PROJECTION_HUD_MATCHORTHO_ID_END));
+    }
+
+    // Does this projection get the user's configured HUD depth?
+    //
+    // DK64 reuses the world's projection-group tags for its 2D content: the
+    // HUD, text boxes, menus and icons are all drawn as ORTHOGRAPHIC
+    // projections that still carry MTXTAG_CAMERAPROJECTION (or
+    // MTXTAG_SKYBOXBLEND, inherited the same way world geometry inherits it).
+    // So the world test has to be type-aware -- an orthographic projection is
+    // never world geometry no matter which tag it carries. Testing the ID
+    // alone left every menu and text box pinned to the screen plane.
+    // NOTE on the full-screen tints (underwater blue, sun glare):
+    //
+    // These still track HUD Depth and should not. They cannot be fixed here.
+    // Measurement showed they are drawn under matrixId 5 through the SAME 4x
+    // orthographic projection as the HUD text and icons - same tag, same
+    // matrix, same projection group - so nothing visible at this layer tells
+    // them apart. An attempt to separate them by projection scale (on the
+    // theory that full-screen quads use DK64's 1x projection and HUD content
+    // its 4x one) was measured to be wrong and has been removed rather than
+    // left in as a special case that risks flattening 1x HUD content.
+    //
+    // The fix has to come from the recompilation patches: emit a distinct
+    // projection group around the tint draws so they arrive here with an ID of
+    // their own, then add that ID to isStereoScreenOverlayId.
+    //
+    // projScaleX is still threaded through for the bring-up logging, which is
+    // what separates DK64's several same-tagged orthographic projections.
+    static bool isStereoHudTarget(uint32_t matrixId, bool isPerspective, float projScaleX) {
+        (void)projScaleX;
+        // At-infinity content gets its own treatment and must not also be given
+        // the HUD depth shift.
+        if (isStereoInfinityProjectionId(matrixId)) {
+            return false;
+        }
+        if (isPerspective) {
+            // World and sky keep their own treatment; only explicitly tagged
+            // perspective HUD elements get the depth shift.
+            return !isStereoProjectionId(matrixId) && isStereoHudProjectionId(matrixId);
+        }
+        // Everything orthographic is 2D content, except the full-screen effects
+        // that carry a tag of their own.
+        return !isStereoScreenOverlayId(matrixId);
     }
 
     // Perspective HUD elements that need a stronger shift than the default
@@ -126,23 +274,27 @@ namespace RT64 {
     // below were tuned at (16:9). Used in place of the live m[0][0] so HUD
     // depth stops tracking the output aspect ratio.
     //
-    // Derived, not measured by eye:
-    //   fovy         = 45.0    (D_global_asm_807444B8, global_asm .data)
-    //   game aspect  = 1.0     (func_global_asm_8062A850() * D_global_asm_807444BC;
-    //                           the FoV multiplier is 1.0 because widescreen_enabled
-    //                           defaults to 0 and the recomp leaves it there - RT64
-    //                           does the widescreen expansion instead)
-    //   guPerspectiveF sets m[0][0] = cot(fovy/2) / aspect = 2.414214 / 1.0
-    //   RT64 then scales it by 1/aspectRatioScale a few lines below, and in
-    //   Expand mode aspectRatioScale = output_aspect / (4/3), i.e. 1.33333 at 16:9
-    //   => 2.414214 / 1.33333 = 1.81066
+    // MEASURED from the live projection at 16:9, not derived. The game side of
+    // it checks out against the ROM:
+    //   fovy        = 45.0 (D_global_asm_807444B8, global_asm .data)
+    //   game aspect = 1.0  (func_global_asm_8062A850() * D_global_asm_807444BC;
+    //                       the multiplier is 1.0 because widescreen_enabled
+    //                       defaults to 0 and the recomp leaves it there - RT64
+    //                       does the widescreen expansion instead)
+    //   so guPerspectiveF gives m[1][1] = cot(fovy/2) = 2.41420, which is
+    //   exactly what the projection log reports.
     //
-    // Unlike BK, DK64's FoV is a variable rather than a compile-time constant, so
-    // this is the value at the *default* camera. It is deliberately frozen: the
-    // live m[0][0] would make HUD depth track both the window shape and any in-game
-    // FoV change. If the game's own widescreen_enabled is ever turned on, the
-    // equivalent constant becomes 1.50888.
-    static constexpr float ReferenceProjectionScale = 1.81066f;
+    // The horizontal term is aspect-dependent, and the projection log shows DK64
+    // producing BOTH of the values you would predict:
+    //     2.41420 / (16/9)  = 1.35799  (widescreen, the common case)
+    //     2.41420 / (4/3)   = 1.81065  (4:3, e.g. character select)
+    // so this constant is a choice of tuning aspect rather than a single truth.
+    // 16:9 is the one to tune against, hence 1.35799.
+    //
+    // Deliberately frozen: DK64's FoV is a variable, not a compile-time
+    // constant, so using the live m[0][0] would make HUD depth track both the
+    // window shape and any in-game FoV change.
+    static constexpr float ReferenceProjectionScale = 1.35799f;
 
     // dynamic3d 1.1 - the shear is the knob.
     //
@@ -167,6 +319,36 @@ namespace RT64 {
         // point. Equivalent to rebuilding the frustum with
         // [L, R] = [-horFov + offset, horFov + offset].
         projMatrix[2][0] += eyeSign * stereoSeparation(separationSlider);
+    }
+
+    // Places a projection's contents at infinity: a constant per-eye disparity of
+    // exactly `separation`, with no depth-dependent parallax, which is what
+    // objects at an unbounded distance produce (dynamic3d 1.2, the z -> infinity
+    // limit of shift_px).
+    //
+    // The orthographic form is the one that matters here: an ortho projection
+    // has clip.w = 1, so ndc.x = x*m[0][0] + m[3][0] and a constant NDC offset is
+    // just added to m[3][0]. The perspective form matches applyStereoOffAxis,
+    // whose shear already yields exactly this in the z -> infinity limit.
+    //
+    // Sign: for the perspective case ndc.x tends to -m[2][0] as z recedes, i.e.
+    // -eyeSign * separation, so the orthographic case has to subtract to match.
+    // This mirrors applyStereoHudShift, which likewise adds for perspective and
+    // subtracts for orthographic.
+    static void applyStereoInfinityShift(interop::float4x4 &projMatrix, StereoEye eye,
+                                         uint32_t separationSlider, bool isOrthographic) {
+        if (eye == StereoEye::None) {
+            return;
+        }
+
+        const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
+        const float separation = stereoSeparation(separationSlider);
+        if (isOrthographic) {
+            projMatrix[3][0] -= eyeSign * separation;
+        }
+        else {
+            projMatrix[2][0] += eyeSign * separation;
+        }
     }
 
     // Apply a constant per-eye horizontal shift to a HUD/UI projection matrix so
@@ -372,12 +554,31 @@ namespace RT64 {
 
             adjustProjectionMatrix(projMatrix, projRatioScale);
 
+            // Temporary bring-up instrumentation, off unless DK64_STEREO_PROJ_LOG is set.
+            {
+                const bool dbgPersp = (proj.type == Projection::Type::Perspective);
+                const bool dbgOrtho = (proj.type == Projection::Type::Orthographic);
+                const bool dbgShear = dbgPersp && isStereoProjectionId(curProjGroup.matrixId);
+                const bool dbgView = dbgPersp && isStereoViewShiftProjectionId(curProjGroup.matrixId);
+                const bool dbgHud = isStereoHudTarget(curProjGroup.matrixId, dbgPersp, projMatrix[0][0]);
+                logStereoProjectionId(curProjGroup.matrixId, dbgPersp, projMatrix[0][0], projMatrix[1][1],
+                    dbgShear, dbgView, dbgHud);
+            }
+
             // Apply stereoscopic off-axis projection offset for world (gameplay)
             // and skybox projections.
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
                 isStereoProjectionId(curProjGroup.matrixId)) {
                 applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation);
+            }
+
+            // Place at-infinity content (the sun and its lens flare) at maximum
+            // positive parallax so it sits behind all world geometry.
+            if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
+                isStereoInfinityProjectionId(curProjGroup.matrixId)) {
+                applyStereoInfinityShift(projMatrix, p.stereoEye, p.stereoSeparation,
+                    proj.type == Projection::Type::Orthographic);
             }
 
             // Apply HUD depth shift to HUD/dialog/cutscene-overlay projections so
@@ -395,8 +596,7 @@ namespace RT64 {
                 // such as FMV/cutscene playback — are left alone so they don't
                 // flicker as the per-eye shifts go in opposite directions.
                 const bool isOrtho = (proj.type == Projection::Type::Orthographic);
-                const bool isHudProjection = (!isStereoProjectionId(curProjGroup.matrixId)) &&
-                    (isOrtho || isStereoHudProjectionId(curProjGroup.matrixId));
+                const bool isHudProjection = isStereoHudTarget(curProjGroup.matrixId, !isOrtho, projMatrix[0][0]);
                 const bool matchOrthoScale = isStereoBubbleProjectionId(curProjGroup.matrixId);
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                     isHudProjection &&
@@ -422,10 +622,18 @@ namespace RT64 {
                     isStereoProjectionId(curProjGroup.matrixId)) {
                     applyStereoOffAxis(adjustedPrevProj, p.stereoEye, p.stereoSeparation);
                 }
+
+                // Same shift on the previous-frame projection, or the lerp that
+                // follows produces a half-shifted matrix that jitters on every
+                // interpolated frame.
+                if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
+                    isStereoInfinityProjectionId(curProjGroup.matrixId)) {
+                    applyStereoInfinityShift(adjustedPrevProj, p.stereoEye, p.stereoSeparation,
+                        proj.type == Projection::Type::Orthographic);
+                }
                 {
                     const bool isOrtho = (proj.type == Projection::Type::Orthographic);
-                    const bool isHudProjection = (!isStereoProjectionId(curProjGroup.matrixId)) &&
-                        (isOrtho || isStereoHudProjectionId(curProjGroup.matrixId));
+                    const bool isHudProjection = isStereoHudTarget(curProjGroup.matrixId, !isOrtho, projMatrix[0][0]);
                     const bool matchOrthoScale = isStereoBubbleProjectionId(curProjGroup.matrixId);
                     if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                         isHudProjection &&
