@@ -201,6 +201,181 @@ namespace RT64 {
         }
     }
 
+    // Third attempt at locating DK64's first-person crosshair.
+    //
+    // It is not a texture rectangle (those turned out to be tiled logo and menu
+    // content) and not a raw triangle (that path never executes at all - zero
+    // calls across thousands of gameplay frames). By elimination it is ordinary
+    // indexed geometry drawn through the orthographic projection, which is also
+    // where every other HUD element lives.
+    //
+    // What separates them at that point is the MODELVIEW tag: DK64 sets
+    // cur_drawn_model_transform_id per model, so sprites, text and the rest each
+    // carry their own id (see interpolationIDs in patches/common_structs.h). The
+    // crosshair should appear as an id that shows up only while aiming.
+    //
+    // Set DK64_STEREO_XHAIR_LOG=0 to silence. Remove once identified.
+    static void logStereoOrthoModelTags(const DrawData &drawData, uint32_t minWorldMatrix,
+                                        uint32_t maxWorldMatrix, uint32_t triangleCount,
+                                        uint32_t faceIndicesStart) {
+        static const bool enabled = [] {
+            const char *v = std::getenv("DK64_STEREO_XHAIR_LOG");
+            return (v == nullptr) || ((v[0] != '\0') && (v[0] != '0'));
+        }();
+        if (!enabled) {
+            return;
+        }
+
+        for (uint32_t m = minWorldMatrix; m <= maxWorldMatrix; m++) {
+            if (m >= drawData.worldTransformGroups.size()) {
+                break;
+            }
+            const uint32_t groupIndex = drawData.worldTransformGroups[m];
+            if (groupIndex >= drawData.transformGroups.size()) {
+                continue;
+            }
+            const uint32_t matrixId = drawData.transformGroups[groupIndex].matrixId;
+
+            // Screen-space extent is what actually separates these: the tag
+            // alone cannot say which 2-triangle ortho sprite is the crosshair,
+            // but the crosshair is the one sitting at the middle of the screen.
+            float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
+            bool havePos = false;
+            const uint32_t indexEnd = faceIndicesStart + (triangleCount * 3);
+            for (uint32_t i = faceIndicesStart; (i < indexEnd) && (i < drawData.faceIndices.size()); i++) {
+                const uint32_t vtx = drawData.faceIndices[i];
+                if (vtx >= drawData.posScreen.size()) {
+                    continue;
+                }
+                const float px = drawData.posScreen[vtx].x;
+                const float py = drawData.posScreen[vtx].y;
+                if (!havePos) {
+                    minX = maxX = px;
+                    minY = maxY = py;
+                    havePos = true;
+                }
+                else {
+                    minX = (px < minX) ? px : minX;
+                    maxX = (px > maxX) ? px : maxX;
+                    minY = (py < minY) ? py : minY;
+                    maxY = (py > maxY) ? py : maxY;
+                }
+            }
+
+            // Bucket the triangle count and quantise the position, so a sprite
+            // that wobbles slightly does not emit a line per frame.
+            const uint32_t triBucket = (triangleCount <= 2) ? triangleCount : ((triangleCount <= 8) ? 8u : 64u);
+            using Key = std::tuple<uint32_t, uint32_t, int32_t, int32_t>;
+            static std::mutex mutex;
+            static std::set<Key> seen;
+            static uint32_t lines = 0;
+            const Key key{matrixId, triBucket, int32_t(minX / 16.0f), int32_t(minY / 16.0f)};
+
+            std::lock_guard<std::mutex> lock(mutex);
+            if ((lines >= 300) || !seen.insert(key).second) {
+                continue;
+            }
+            lines++;
+
+            char buf[200];
+            if (havePos) {
+                snprintf(buf, sizeof(buf), "ortho tag 0x%08X tris<=%u  screen x[%.0f..%.0f] y[%.0f..%.0f] size %.0fx%.0f",
+                    matrixId, triBucket, minX, maxX, minY, maxY, maxX - minX, maxY - minY);
+            }
+            else {
+                snprintf(buf, sizeof(buf), "ortho tag 0x%08X tris<=%u  (no screen positions)", matrixId, triBucket);
+            }
+            fprintf(stderr, "[stereo-xhair-tag] %s\n", buf);
+            FILE *f = fopen("stereo_crosshair.log", "a");
+            if (f != nullptr) {
+                fprintf(f, "TAG %s\n", buf);
+                fclose(f);
+            }
+        }
+    }
+
+    // Matches the signature the crosshair search converged on: an UNTAGGED,
+    // roughly square, modestly sized orthographic quad whose centre sits near
+    // the middle of the screen.
+    //
+    // Measured, DK64's first-person crosshair is nine 32x32 quads forming a
+    // 96x96 grid centred on screen, all carrying G_EX_ID_AUTO. Being untagged is
+    // what forces a geometric test rather than an id test - there is no id to
+    // match. Everything else untagged in the same projection is text sitting at
+    // the top or bottom of the frame, and the lens flare carries solar-flare ids
+    // which are excluded explicitly.
+    static bool stereoIsCrosshairCandidate(const DrawData &drawData, uint32_t minWorldMatrix,
+                                           uint32_t maxWorldMatrix, uint32_t triangleCount,
+                                           uint32_t faceIndicesStart, const FixedRect &scissor) {
+        // One quad.
+        if (triangleCount != 2) {
+            return false;
+        }
+
+        for (uint32_t m = minWorldMatrix; m <= maxWorldMatrix; m++) {
+            if (m >= drawData.worldTransformGroups.size()) {
+                return false;
+            }
+            const uint32_t groupIndex = drawData.worldTransformGroups[m];
+            if (groupIndex >= drawData.transformGroups.size()) {
+                return false;
+            }
+            if (drawData.transformGroups[groupIndex].matrixId != G_EX_ID_AUTO) {
+                return false;
+            }
+        }
+
+        float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
+        bool havePos = false;
+        const uint32_t indexEnd = faceIndicesStart + (triangleCount * 3);
+        for (uint32_t i = faceIndicesStart; (i < indexEnd) && (i < drawData.faceIndices.size()); i++) {
+            const uint32_t vtx = drawData.faceIndices[i];
+            if (vtx >= drawData.posScreen.size()) {
+                continue;
+            }
+            const float px = drawData.posScreen[vtx].x;
+            const float py = drawData.posScreen[vtx].y;
+            if (!havePos) {
+                minX = maxX = px;
+                minY = maxY = py;
+                havePos = true;
+            }
+            else {
+                minX = (px < minX) ? px : minX;
+                maxX = (px > maxX) ? px : maxX;
+                minY = (py < minY) ? py : minY;
+                maxY = (py > maxY) ? py : maxY;
+            }
+        }
+
+        if (!havePos) {
+            return false;
+        }
+
+        const float w = maxX - minX;
+        const float h = maxY - minY;
+        if ((w < 8.0f) || (h < 8.0f) || (w > 64.0f) || (h > 64.0f)) {
+            return false;
+        }
+        // Roughly square, which separates the reticle tiles from text runs.
+        if ((w > (h * 1.6f)) || (h > (w * 1.6f))) {
+            return false;
+        }
+
+        const float sw = float(scissor.width(false, true));
+        const float sh = float(scissor.height(false, true));
+        if ((sw <= 0.0f) || (sh <= 0.0f)) {
+            return false;
+        }
+        const float cx = float(scissor.left(false)) + (sw * 0.5f);
+        const float cy = float(scissor.top(false)) + (sh * 0.5f);
+        const float bx = (minX + maxX) * 0.5f;
+        const float by = (minY + maxY) * 0.5f;
+        // Within a fifth of the viewport of centre in each axis, which covers the
+        // whole 3x3 grid without reaching the text bands.
+        return (std::fabs(bx - cx) < (sw * 0.2f)) && (std::fabs(by - cy) < (sh * 0.2f));
+    }
+
     // Helper functions.
     
     RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
@@ -1782,6 +1957,27 @@ namespace RT64 {
                             instanceDrawCall.type = InstanceDrawCall::Type::IndexedTriangles;
                             triangles.indexStart = triangles.vertexTestZ ? vertexTestZFaceIndicesStart : call.meshDesc.faceIndicesStart;
                             invRatioScale = projInvRatioScale;
+                            if (proj.type == Projection::Type::Orthographic) {
+                                logStereoOrthoModelTags(drawData, call.callDesc.minWorldMatrix,
+                                    call.callDesc.maxWorldMatrix, call.callDesc.triangleCount,
+                                    call.meshDesc.faceIndicesStart);
+
+                                // Place the first-person crosshair at the depth
+                                // being aimed at rather than at HUD depth.
+                                //
+                                // Gated on stereoCrosshairValid, which is false
+                                // whenever there is no aim depth. That is what
+                                // keeps the title screen's centred logo out of
+                                // this: it matches the geometry closely, but that
+                                // screen renders no world depth, so there is
+                                // nothing for it to match against.
+                                if (p.stereoCrosshairValid &&
+                                    stereoIsCrosshairCandidate(drawData, call.callDesc.minWorldMatrix,
+                                        call.callDesc.maxWorldMatrix, call.callDesc.triangleCount,
+                                        call.meshDesc.faceIndicesStart, fbPair.scissorRect)) {
+                                    triangles.screenOffset.x += p.stereoCrosshairOffsetX;
+                                }
+                            }
                             break;
                         }
                         case Projection::Type::Rectangle: {

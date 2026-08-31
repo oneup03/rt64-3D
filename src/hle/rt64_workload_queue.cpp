@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <atomic>
 #include <cstdarg>
+#include <cstring>
 #include <cstdlib>
 
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
@@ -76,6 +77,44 @@ namespace RT64 {
     // the render thread where the depth is sampled and read a few lines earlier
     // in the same loop on the following frame, hence the atomic.
     static std::atomic<uint32_t> stereoAutoConvergenceTenths{0};
+
+    // Centre-of-screen view depth in game units, as float bits, or 0 when there
+    // is nothing valid. Feeds the depth-aware crosshair.
+    static std::atomic<uint32_t> stereoCenterViewZBits{0};
+
+    static void stereoStoreCenterViewZ(float viewZ) {
+        uint32_t bits = 0;
+        if (viewZ > 0.0f) {
+            std::memcpy(&bits, &viewZ, sizeof(bits));
+        }
+        stereoCenterViewZBits.store(bits, std::memory_order_relaxed);
+    }
+
+    static float stereoLoadCenterViewZ() {
+        const uint32_t bits = stereoCenterViewZBits.load(std::memory_order_relaxed);
+        if (bits == 0) {
+            return -1.0f;
+        }
+        float viewZ = 0.0f;
+        std::memcpy(&viewZ, &bits, sizeof(viewZ));
+        return viewZ;
+    }
+
+    // The aim depth driving the crosshair. Logged on meaningful change so that
+    // "the reticle sits too deep" can be checked against a number rather than
+    // guessed at - aiming at something a known distance away should report a
+    // depth in the same ballpark as the near depth the convergence loop sees.
+    static void logStereoAimDepth(float aimZ) {
+        static float lastLogged = -1.0f;
+        if (aimZ <= 0.0f) {
+            return;
+        }
+        if ((lastLogged > 0.0f) && (std::fabs(aimZ - lastLogged) < (lastLogged * 0.10f))) {
+            return;
+        }
+        lastLogged = aimZ;
+        stereoDepthLogLine("aim: z=%.1f", aimZ);
+    }
 
     static void logStereoAutoConvergence(float nearestZ, uint32_t manualTenths, uint32_t appliedTenths) {
         static uint32_t lastLogged = UINT32_MAX;
@@ -826,6 +865,68 @@ namespace RT64 {
                             // as everything else.
                             drawParams.stereoRectOffsetX = -eyeSign * hudOffset * perspectiveToOrthoScale;
                         }
+
+                        // Depth-aware crosshair (dynamic3d 5.1). The reticle is
+                        // orthographic, so it normally rides the HUD depth shift
+                        // applied to that projection. Placing it at the aimed
+                        // depth means applying the disparity for that depth and
+                        // cancelling the HUD shift it would otherwise have got.
+                        const float centerZ = stereoLoadCenterViewZ();
+                        const auto &ccfg = ext.sharedResources->userConfig;
+                        {
+                            const float separation = float(ccfg.stereoSeparation) * (0.10f / 50.0f);
+                            uint32_t convTenths = ccfg.stereoConvergence;
+                            if (ccfg.stereoAutoConvergence != 0) {
+                                const uint32_t autoTenths = stereoAutoConvergenceTenths.load(std::memory_order_relaxed);
+                                if (autoTenths > 0) {
+                                    convTenths = std::min(autoTenths, convTenths);
+                                }
+                            }
+                            const float convergence = float(convTenths) * 2.0f;
+                            const float eyeSign = (stereoEye == StereoEye::Left) ? +1.0f : -1.0f;
+
+                            // dynamic3d 1.2 in NDC: zero at the convergence
+                            // distance, tending to the full separation offset as
+                            // the aim point recedes.
+                            //
+                            // With no usable depth the reticle recedes to
+                            // INFINITY rather than falling back to the screen
+                            // plane. Aiming at open sky should put it far away,
+                            // and a reticle that snaps forward to the glass
+                            // whenever the sample drops out is far more jarring
+                            // than one that sits deep. This matches what the
+                            // Perfect Dark port does when no aim target resolves.
+                            const float depthRatio = (centerZ > 0.0f) ? (convergence / centerZ) : 0.0f;
+                            const float aimNdc = -eyeSign * separation * (1.0f - depthRatio);
+
+                            // What the orthographic HUD shift already applies, so
+                            // it can be removed rather than compounded.
+                            float hudNdc = 0.0f;
+                            const auto hudDepth = ccfg.stereoHudDepth;
+                            if (hudDepth != 50) {
+                                const float centered = (static_cast<float>(hudDepth) - 50.0f) / 50.0f;
+                                constexpr float maxHudOffset = 0.04f;
+                                constexpr float perspectiveToOrthoScale = 2.75f;
+                                hudNdc = -eyeSign * (-centered * maxHudOffset) * perspectiveToOrthoScale;
+                            }
+
+                            drawParams.stereoCrosshairOffsetX = aimNdc - hudNdc;
+                            // The geometric test cannot tell the reticle from the
+                            // title screen's centred logo, and a depth gate does
+                            // not separate them either - that screen runs a 3D
+                            // demo behind it, so it has a world pass and a valid
+                            // depth like any other.
+                            //
+                            // What does separate them is game state: the crosshair
+                            // only exists in Adventure play, and the game already
+                            // reports menu, demo and cutscene scenes for the
+                            // convergence loop. Reusing that flag costs nothing
+                            // and is a statement about the game rather than a
+                            // guess about geometry.
+                            drawParams.stereoCrosshairValid = (stereoMode != UserConfiguration::StereoMode::Off) &&
+                                (stereoEye != StereoEye::None) && (separation > 0.0f) &&
+                                (ccfg.stereoSceneLowConvergence == 0);
+                        }
                     }
                     framebufferRenderer->addFramebuffer(drawParams);
                 }
@@ -1027,7 +1128,19 @@ namespace RT64 {
                         if (mainPass) {
                             static StereoDepthSampler stereoDepthSampler;
                             static StereoAutoConvergence stereoAutoConvergence;
-                            if (stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget)) {
+                            // Aim point in depth-target texels, taken from the
+                            // frame's scissor rather than from the target's own
+                            // dimensions. The target can be padded and carries a
+                            // horizontal misalignment of its own, so its midpoint
+                            // is not where the reticle is - centring on it put the
+                            // sample window off to the right of the crosshair,
+                            // reading only its middle-to-right-edge.
+                            const FixedRect &aimRect = fbPair.scissorRect;
+                            const int32_t aimCenterX = int32_t(
+                                ((aimRect.left(false) + (aimRect.width(false, true) / 2)) * fixedResScale[0])) - depthTarget->misalignX;
+                            const int32_t aimCenterY = int32_t(
+                                ((aimRect.top(false) + (aimRect.height(false, true) / 2)) * fixedResScale[1]));
+                            if (stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget, aimCenterX, aimCenterY)) {
                                 const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
                                 logStereoDepthSample(sample.valid ? sample.medianDeviceDepth : -1.0f);
 
@@ -1039,6 +1152,9 @@ namespace RT64 {
                                 const auto &cfg = ext.sharedResources->userConfig;
                                 if (sample.valid && (cfg.stereoAutoConvergence != 0) &&
                                     stereoGetWorldDepthTerms(projM22, projM32)) {
+                                    const float aimZ = stereoDeviceDepthToViewZ(sample.medianDeviceDepth, projM22, projM32);
+                                    stereoStoreCenterViewZ(aimZ);
+                                    logStereoAimDepth(aimZ);
                                     const float nearestZ = stereoDeviceDepthToViewZ(sample.nearestDeviceDepth, projM22, projM32);
                                     // Ceiling is the user's UNSCALED slider. Using
                                     // the effective value made the ceiling flicker

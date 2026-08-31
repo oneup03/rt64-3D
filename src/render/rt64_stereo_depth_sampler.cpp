@@ -15,9 +15,9 @@ namespace RT64 {
     // patch's offset legal as a texture-copy placed-footprint offset.
     static constexpr uint32_t PatchStride =
         StereoDepthSampler::FootprintRowTexels * StereoDepthSampler::PatchSize * DepthTexelSize;
-    static constexpr uint32_t PatchBufferSize = PatchStride * StereoDepthSampler::PatchCount;
+    static constexpr uint32_t PatchBufferSize = PatchStride * StereoDepthSampler::TotalPatchCount;
 
-    bool StereoDepthSampler::submit(RenderWorker *worker, RenderTarget *depthTarget) {
+    bool StereoDepthSampler::submit(RenderWorker *worker, RenderTarget *depthTarget, int32_t aimCenterX, int32_t aimCenterY) {
         if ((worker == nullptr) || (depthTarget == nullptr)) {
             return false;
         }
@@ -90,9 +90,53 @@ namespace RT64 {
             }
         }
 
+        // Aim window: AimPatchCols patches spread across a span PROPORTIONAL to
+        // the frame, not butted together at a fixed pixel width.
+        //
+        // Packed side by side they covered 160 texels, which is about 4% of a 4K
+        // frame's width while the reticle spans nearer 30% - so however well it
+        // was centred it only ever read a sliver near the middle, and the halves
+        // of the reticle contributed nothing. The span now scales with the
+        // target so the same fraction of the reticle is covered at any render
+        // resolution.
+        // A sixteenth of the frame. Measured against DK64's reticle, which is
+        // roughly 865 texels wide at 4K, an eighth reached most of the way across
+        // it; this covers the middle third, which is the part the player is
+        // actually pointing with.
+        const int32_t aimSpan = std::max<int32_t>(int32_t(AimPatchCols * PatchSize), int32_t(targetWidth) / 16);
+        for (uint32_t i = 0; i < AimPatchCols; i++) {
+            const uint32_t index = PatchCount + i;
+            const int32_t step = (AimPatchCols > 1) ? (aimSpan / int32_t(AimPatchCols - 1)) : 0;
+            int32_t left = (aimCenterX - (aimSpan / 2)) + (int32_t(i) * step) - int32_t(PatchSize / 2);
+            int32_t top = aimCenterY - int32_t(PatchSize / 2);
+            left = std::max(0, std::min(left, int32_t(targetWidth - PatchSize)));
+            top = std::max(0, std::min(top, int32_t(targetHeight - PatchSize)));
+
+            const RenderTextureCopyLocation dstLocation = RenderTextureCopyLocation::PlacedFootprint(
+                slot.buffer.get(), RenderFormat::D32_FLOAT, FootprintRowTexels, PatchSize, 1,
+                FootprintRowTexels, uint64_t(index) * PatchStride);
+            const RenderBox srcBox(left, top, left + int32_t(PatchSize), top + int32_t(PatchSize));
+            worker->commandList->copyTextureRegion(dstLocation, srcLocation, 0, 0, 0, &srcBox);
+        }
+
         // Hand the target back in the layout the rest of the frame expects.
         worker->commandList->barriers(RenderBarrierStage::GRAPHICS,
             RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
+
+        {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                FILE *f = fopen("stereo_depth.log", "a");
+                if (f != nullptr) {
+                    fprintf(f, "(aim geometry: target %ux%u, aim centre (%d,%d), span %d, target midpoint %u)\n",
+                        targetWidth, targetHeight, aimCenterX, aimCenterY, aimSpan, targetWidth / 2);
+                    fclose(f);
+                }
+                fprintf(stderr, "[stereo-depth] aim geometry: target %ux%u centre (%d,%d) span %d midpoint %u\n",
+                    targetWidth, targetHeight, aimCenterX, aimCenterY, aimSpan, targetWidth / 2);
+            }
+        }
 
         slot.queued = true;
         frameIndex++;
@@ -134,15 +178,24 @@ namespace RT64 {
         // stray texels from particles, but sensitive to anything filling a
         // meaningful part of one small patch), then a low order statistic ACROSS
         // the patch results. A small object only has to dominate one patch.
-        const uint32_t centreIndex = ((PatchRows / 2) * PatchCols) + (PatchCols / 2);
+        // The aim depth is taken from a horizontal BAND of patches across the
+        // middle row, not the single centre patch. One 32x32 window is 0.8% of a
+        // 4K frame's width, narrow enough that the value swings depending on
+        // exactly what sliver of geometry sits under it - which showed up as the
+        // reticle sitting at a depth that did not match the thing it was over,
+        // reading as one eye aiming at the target and the other not. Three
+        // patches of the middle row span about a fifth of the width and give a
+        // far more representative answer, at no extra copy cost.
+        const uint32_t centreIndexLo = PatchCount;
+        const uint32_t centreIndexHi = PatchCount + AimPatchCols - 1;
         std::vector<float> patchSamples;
         std::vector<float> patchNears;
         std::vector<float> centreSamples;
         patchSamples.reserve(PatchSize * PatchSize);
         patchNears.reserve(PatchCount);
-        centreSamples.reserve(PatchSize * PatchSize);
+        centreSamples.reserve(AimPatchCols * PatchSize * PatchSize);
 
-        for (uint32_t patch = 0; patch < PatchCount; patch++) {
+        for (uint32_t patch = 0; patch < TotalPatchCount; patch++) {
             const float *patchData = data + ((size_t(patch) * PatchStride) / DepthTexelSize);
             patchSamples.clear();
             for (uint32_t y = 0; y < PatchSize; y++) {
@@ -158,8 +211,14 @@ namespace RT64 {
                 }
             }
 
-            if (patch == centreIndex) {
-                centreSamples = patchSamples;
+            if ((patch >= centreIndexLo) && (patch <= centreIndexHi)) {
+                centreSamples.insert(centreSamples.end(), patchSamples.begin(), patchSamples.end());
+            }
+
+            // Aim patches are for the crosshair only; letting them into the
+            // wide near statistic would double-count the centre of the frame.
+            if (patch >= PatchCount) {
+                continue;
             }
 
             // Require enough coverage that the percentile means something.
@@ -179,9 +238,28 @@ namespace RT64 {
         }
 
         if (!centreSamples.empty()) {
-            const size_t centreMid = centreSamples.size() / 2;
-            std::nth_element(centreSamples.begin(), centreSamples.begin() + centreMid, centreSamples.end());
-            result.medianDeviceDepth = centreSamples[centreMid];
+            // Very close to the minimum, but not the minimum.
+            //
+            // The aim depth wants the NEAREST surface in the window, not a
+            // representative one. A 10th percentile only finds the target if the
+            // target fills more than a tenth of the window, so aiming at
+            // anything small returned the background behind it and the reticle
+            // sat too deep - which is exactly how it looked on close geometry.
+            //
+            // Literal min is the other extreme, and one bad texel is enough to
+            // ruin it - an alpha edge, a particle, a sliver of geometry clipping
+            // the window. dynamic3d 4.1 warns against min for that reason, but
+            // that warning is about the WIDE region of interest, where a single
+            // spike anywhere on screen would slam convergence. This window is
+            // small and spatially coherent, so the same argument does not carry:
+            // a real surface under the reticle covers hundreds of texels, while
+            // a speck covers a handful.
+            //
+            // A ~1.5% percentile is min-like for anything real and still needs
+            // dozens of bad texels in a row to be fooled.
+            const size_t centreNear = centreSamples.size() / 64;
+            std::nth_element(centreSamples.begin(), centreSamples.begin() + centreNear, centreSamples.end());
+            result.medianDeviceDepth = centreSamples[centreNear];
         }
 
         // Smaller device depth is closer under a standard depth range, so the
@@ -323,10 +401,18 @@ namespace RT64 {
         // For a standard perspective projection, clip.z = view.z * m[2][2] + m[3][2]
         // and clip.w = -view.z, so ndc.z = -(m[2][2] + m[3][2] / view.z) and
         //     view.z = m[3][2] / (-ndc.z - m[2][2]).
-        // The sign conventions differ between the GL-style matrix the N64 builds
-        // and the [0,1] device range the backends use, so this is derived from
-        // the live matrix rather than from hardcoded near/far values.
-        const float denom = -deviceDepth - projM22;
+        //
+        // The device depth is NOT ndc.z. The buffer holds [0,1] while the N64's
+        // GL-style projection produces ndc.z over [-1,1], so it has to be mapped
+        // back before the inversion. Feeding the device value in directly - which
+        // this did - overestimates distance by 1.75x to 1.9x over DK64's depth
+        // range, which put the crosshair well behind whatever it was aimed at and
+        // made the convergence loop think everything was further away than it is.
+        // This is exactly the convention assumption dynamic3d 4.1 warns about;
+        // it was caught by checking the inversion against known samples rather
+        // than by reading the code.
+        const float ndcZ = (2.0f * deviceDepth) - 1.0f;
+        const float denom = -ndcZ - projM22;
         if (std::fabs(denom) < 1e-6f) {
             return -1.0f;
         }

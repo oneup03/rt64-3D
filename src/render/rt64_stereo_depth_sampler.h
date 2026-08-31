@@ -43,6 +43,15 @@ namespace RT64 {
         static constexpr uint32_t PatchCols = 9;
         static constexpr uint32_t PatchRows = 5;
         static constexpr uint32_t PatchCount = PatchCols * PatchRows;
+        // Extra patches for the AIM depth, placed contiguously at the centre of
+        // the frame rather than reusing the spread grid. The grid is built to
+        // cover a wide area for the convergence loop; reusing three of its
+        // patches for the crosshair drew the aim depth from a region a fifth of
+        // the screen wide, so the reticle latched onto whatever was nearest
+        // anywhere in that span instead of what sits under it. These three are
+        // adjacent, giving a tight window centred on the aim point.
+        static constexpr uint32_t AimPatchCols = 3;
+        static constexpr uint32_t TotalPatchCount = PatchCount + AimPatchCols;
         // Footprint rows must be 256-byte aligned for the buffer copy, and the
         // depth format is 4 bytes per texel, so the footprint is padded out to
         // 64 texels per row and only the first PatchSize of each are read.
@@ -67,7 +76,13 @@ namespace RT64 {
         // per framebuffer PAIR and a frame has several - the world pass plus
         // smaller auxiliary ones whose centre depth is empty - so it is the
         // caller's job to offer only the main pass.
-        bool submit(RenderWorker *worker, RenderTarget *depthTarget);
+        // aimCenterX/Y are the aim point in DEPTH TARGET texels. They are passed
+        // in rather than derived from the target's own dimensions because the
+        // two are not the same thing: a render target can be padded and can carry
+        // a horizontal misalignment relative to the visible viewport, so
+        // targetWidth/2 is not where the player is looking. Centring on it put
+        // the aim window off to one side of the reticle.
+        bool submit(RenderWorker *worker, RenderTarget *depthTarget, int32_t aimCenterX, int32_t aimCenterY);
 
         struct Sample {
             bool valid = false;

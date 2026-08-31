@@ -153,6 +153,16 @@ namespace RT64 {
             // of the HUD as the user moves the HUD Depth slider. Zero when
             // stereo is off.
             float stereoRectOffsetX = 0.0f;
+            // Per-eye NDC shift that places the first-person crosshair at the
+            // depth being aimed at, relative to where the HUD depth shift would
+            // otherwise have put it. Only meaningful when stereoCrosshairValid.
+            float stereoCrosshairOffsetX = 0.0f;
+            // False whenever there is no aim depth this frame - no world pass,
+            // stereo off, or the depth sample was not usable. Gating on this is
+            // also what keeps the title screen's centred logo out of it: that
+            // screen renders no depth, so nothing there can be mistaken for a
+            // crosshair however closely it matches the geometry.
+            bool stereoCrosshairValid = false;
         };
 
         FramebufferRenderer(RenderWorker *worker, bool rtSupport, UserConfiguration::GraphicsAPI graphicsAPI, const ShaderLibrary *shaderLibrary);
