@@ -105,6 +105,7 @@ namespace RT64 {
         stereoConvergenceManual = 200;
         stereoComfortTarget = 5;
         stereoSceneLowConvergence = 0;
+        stereoSceneFirstPerson = 0;
     }
 
     void UserConfiguration::validate() {
@@ -129,6 +130,7 @@ namespace RT64 {
         stereoConvergenceManual = std::clamp<uint32_t>(stereoConvergenceManual, 1, 500);
         stereoComfortTarget = std::clamp<int32_t>(stereoComfortTarget, -50, 60);
         stereoSceneLowConvergence = (stereoSceneLowConvergence != 0) ? 1 : 0;
+        stereoSceneFirstPerson = (stereoSceneFirstPerson != 0) ? 1 : 0;
         resolutionMultiplier = std::clamp<double>(resolutionMultiplier, 0.0f, ResolutionMultiplierLimit);
         downsampleMultiplier = std::clamp<int>(downsampleMultiplier, 1, ResolutionMultiplierLimit);
         aspectTarget = std::clamp<double>(aspectTarget, 0.1f, 100.0f);

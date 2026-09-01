@@ -158,6 +158,14 @@ namespace RT64 {
         // each cut, which is exactly when a close framing reads worst.
         uint32_t stereoSceneLowConvergence;
 
+        // 1 while the game reports the first-person camera as live. The reticle
+        // search is geometric - untagged, roughly square, centred quads - and a
+        // pause-menu icon or a bananaport transition tile fits that description
+        // just as well. Both occur inside Adventure mode, so the scene
+        // classification above does not exclude them; this does, by confining
+        // the search to frames where a reticle actually exists.
+        uint32_t stereoSceneFirstPerson;
+
         UserConfiguration();
         void validate();
         uint32_t msaaSampleCount() const;

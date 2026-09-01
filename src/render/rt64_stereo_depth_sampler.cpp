@@ -58,14 +58,25 @@ namespace RT64 {
         worker->commandList->barriers(RenderBarrierStage::COPY,
             RenderTextureBarrier(texture, RenderTextureLayout::COPY_SOURCE));
 
-        // Spread the grid over the middle ~90% of the frame, still stopping
-        // short of the very edges where HUD-hugging geometry would drag the near
-        // statistic down.
+        // Spread the grid over most of the frame, stopping short of the edges
+        // where HUD-hugging geometry would drag the near statistic down.
+        //
+        // The vertical margins are deliberately ASYMMETRIC. Geometry that is
+        // permanently close to the camera and must not be chased - a mounted
+        // cannon filling the bottom of a minigame's frame, and viewmodel-like
+        // props generally - sits low, because that is where a game puts things
+        // attached to the viewer. The top of the frame is sky and distant
+        // scenery, which is exactly what the loop wants to see. A symmetric box
+        // has to choose between including that clutter and discarding the useful
+        // half, and including it is what made convergence oscillate: the cannon
+        // is near enough to win the near statistic but marginal enough to drop
+        // in and out of it, so the loop flipped between two stable solves every
+        // few frames.
         const RenderTextureCopyLocation srcLocation = RenderTextureCopyLocation::Subresource(texture, 0);
-        const uint32_t usableW = (targetWidth * 9) / 10;
-        const uint32_t usableH = (targetHeight * 9) / 10;
-        const uint32_t originX = (targetWidth - usableW) / 2;
-        const uint32_t originY = (targetHeight - usableH) / 2;
+        const uint32_t usableW = (targetWidth * (100 - RoiMarginLeftPercent - RoiMarginRightPercent)) / 100;
+        const uint32_t usableH = (targetHeight * (100 - RoiMarginTopPercent - RoiMarginBottomPercent)) / 100;
+        const uint32_t originX = (targetWidth * RoiMarginLeftPercent) / 100;
+        const uint32_t originY = (targetHeight * RoiMarginTopPercent) / 100;
 
         for (uint32_t row = 0; row < PatchRows; row++) {
             for (uint32_t col = 0; col < PatchCols; col++) {
@@ -122,21 +133,6 @@ namespace RT64 {
         // Hand the target back in the layout the rest of the frame expects.
         worker->commandList->barriers(RenderBarrierStage::GRAPHICS,
             RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
-
-        {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
-                FILE *f = fopen("stereo_depth.log", "a");
-                if (f != nullptr) {
-                    fprintf(f, "(aim geometry: target %ux%u, aim centre (%d,%d), span %d, target midpoint %u)\n",
-                        targetWidth, targetHeight, aimCenterX, aimCenterY, aimSpan, targetWidth / 2);
-                    fclose(f);
-                }
-                fprintf(stderr, "[stereo-depth] aim geometry: target %ux%u centre (%d,%d) span %d midpoint %u\n",
-                    targetWidth, targetHeight, aimCenterX, aimCenterY, aimSpan, targetWidth / 2);
-            }
-        }
 
         slot.queued = true;
         frameIndex++;

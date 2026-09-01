@@ -40,6 +40,15 @@ namespace RT64 {
         // of 32x32 is ~46k depth texels per frame - still a small fraction of a
         // 4K depth target, and dense enough that a near object anywhere in frame
         // lands in several of them rather than being missed between samples.
+        // Frame edges excluded from the near statistic, as percentages. The
+        // bottom margin is much larger than the top: see the placement code in
+        // the .cpp for why the box has to be asymmetric rather than merely
+        // wide. Raising RoiMarginBottomPercent excludes more low-frame clutter
+        // at the cost of ignoring genuinely near floor when looking down.
+        static constexpr uint32_t RoiMarginLeftPercent = 5;
+        static constexpr uint32_t RoiMarginRightPercent = 5;
+        static constexpr uint32_t RoiMarginTopPercent = 5;
+        static constexpr uint32_t RoiMarginBottomPercent = 25;
         static constexpr uint32_t PatchCols = 9;
         static constexpr uint32_t PatchRows = 5;
         static constexpr uint32_t PatchCount = PatchCols * PatchRows;

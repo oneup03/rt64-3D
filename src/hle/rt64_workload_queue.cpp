@@ -19,58 +19,16 @@
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
 
 namespace RT64 {
-    // Temporary stereo depth bring-up instrumentation. DK64_STEREO_DEPTH_LOG=1
-    // enables the readback and writes the sampled centre depth to
-    // stereo_depth.log, alongside both candidate device-depth conventions
-    // evaluated against DK64's near/far (10 / 1500). dynamic3d 4.1 warns not to
-    // assume which convention a renderer uses, so this reports both and lets a
-    // known-distance observation pick the right one. Remove once calibrated.
-    // Depth readback for the depth-aware stereo features. On by default now
-    // that the crash is fixed; set DK64_STEREO_DEPTH_SAMPLE=0 to turn it off.
+    // Depth readback for the depth-aware stereo features.
     //
-    // The crash was not what it looked like. The copy is issued from inside the
-    // framebuffer loop, which looked like recording a texture copy during an
-    // active render pass, but plume's copyTextureRegion ends the pass itself.
-    // The real cause was that plume's VULKAN backend only implemented
-    // buffer -> image copies: every other combination fell through to a generic
-    // branch that dereferences the destination texture, which is null when the
-    // destination is a buffer. D3D12 was fine throughout. The missing
-    // image -> buffer path is now implemented in plume_vulkan.cpp.
-    //
-    // An earlier opt-IN variable also hid the fact that this code had never
-    // executed at all - an empty log looked identical to a disabled one - hence
-    // the explicit "sampling active" heartbeat in logStereoDepthSample.
-    static bool stereoDepthSamplingEnabled() {
-        static const bool enabled = [] {
-            const char *v = std::getenv("DK64_STEREO_DEPTH_SAMPLE");
-            return (v == nullptr) || ((v[0] != 0) && (v[0] != '0'));
-        }();
-        return enabled;
-    }
-
-    // Writes to both the log file and stderr. The console copy matters because
-    // the file lands in whatever the process's working directory happens to be,
-    // which is not always where you expect.
-    static void stereoDepthLogLine(const char *fmt, ...) {
-        static uint32_t linesWritten = 0;
-        if (linesWritten >= 4000) {
-            return;
-        }
-        linesWritten++;
-
-        char buf[256];
-        va_list args;
-        va_start(args, fmt);
-        vsnprintf(buf, sizeof(buf), fmt, args);
-        va_end(args);
-
-        fprintf(stderr, "[stereo-depth] %s\n", buf);
-        FILE *f = fopen("stereo_depth.log", "a");
-        if (f != nullptr) {
-            fprintf(f, "%s\n", buf);
-            fclose(f);
-        }
-    }
+    // The copy is issued from inside the framebuffer loop, which looks like
+    // recording a texture copy during an active render pass - it is not, plume's
+    // copyTextureRegion ends the pass itself. What did crash here was plume's
+    // VULKAN backend, which only implemented buffer -> image copies; every other
+    // combination fell through to a generic branch that dereferences the
+    // destination texture, null when the destination is a buffer. D3D12 was fine
+    // throughout. The missing image -> buffer path is implemented in
+    // plume_vulkan.cpp.
 
     // Convergence the depth loop wants, in tenths of a slider unit, or 0 when it
     // has nothing to say and the user's manual value should stand. Written on
@@ -98,100 +56,6 @@ namespace RT64 {
         float viewZ = 0.0f;
         std::memcpy(&viewZ, &bits, sizeof(viewZ));
         return viewZ;
-    }
-
-    // The aim depth driving the crosshair. Logged on meaningful change so that
-    // "the reticle sits too deep" can be checked against a number rather than
-    // guessed at - aiming at something a known distance away should report a
-    // depth in the same ballpark as the near depth the convergence loop sees.
-    static void logStereoAimDepth(float aimZ) {
-        static float lastLogged = -1.0f;
-        if (aimZ <= 0.0f) {
-            return;
-        }
-        if ((lastLogged > 0.0f) && (std::fabs(aimZ - lastLogged) < (lastLogged * 0.10f))) {
-            return;
-        }
-        lastLogged = aimZ;
-        stereoDepthLogLine("aim: z=%.1f", aimZ);
-    }
-
-    static void logStereoAutoConvergence(float nearestZ, uint32_t manualTenths, uint32_t appliedTenths) {
-        static uint32_t lastLogged = UINT32_MAX;
-        // Only on a real change, so a steady scene stays quiet.
-        if (appliedTenths == lastLogged) {
-            return;
-        }
-        lastLogged = appliedTenths;
-        stereoDepthLogLine("autoconv: nearestZ=%.1f manual=%.1f applied=%.1f",
-            nearestZ, manualTenths * 0.1f, appliedTenths * 0.1f);
-    }
-
-    // Reports the first few depth targets offered for sampling and whether the
-    // size gate accepted them. Without this, "no output at all" is ambiguous
-    // between the gate rejecting everything and the readback returning nothing.
-    static void logStereoDepthCandidate(uint32_t depthW, uint32_t depthH,
-                                        uint32_t colorW, uint32_t colorH, bool accepted) {
-        static uint32_t reported = 0;
-        if (reported >= 8) {
-            return;
-        }
-        reported++;
-        stereoDepthLogLine("(candidate depth %ux%u vs colour %ux%u -> %s)",
-            depthW, depthH, colorW, colorH, accepted ? "sampled" : "skipped");
-    }
-
-    static void logStereoDepthSample(float deviceDepth) {
-        // A periodic summary rather than a per-frame heartbeat. The first
-        // version logged on every invalid frame, and because valid and invalid
-        // samples alternated it consumed the whole line budget in seconds and
-        // silenced the log - which read as "no depth data" while sampling was
-        // in fact working. A summary keeps "sampling is running" distinguishable
-        // from "sampling is disabled" without drowning the useful lines.
-        static uint32_t sampled = 0;
-        static uint32_t validCount = 0;
-        static float lastValid = -1.0f;
-
-        sampled++;
-        if (deviceDepth > 0.0f) {
-            validCount++;
-            lastValid = deviceDepth;
-        }
-
-        if ((sampled % 600) == 0) {
-            stereoDepthLogLine("(status: %u sampled, %u valid, last=%.6f)", sampled, validCount, lastValid);
-        }
-
-        if (deviceDepth <= 0.0f) {
-            return;
-        }
-
-        // Only log on a meaningful change, so walking around produces a
-        // readable trace instead of 60 identical lines a second.
-        static float lastLogged = -1.0f;
-        if ((lastLogged > 0.0f) && (std::fabs(deviceDepth - lastLogged) < (lastLogged * 0.02f))) {
-            return;
-        }
-        lastLogged = deviceDepth;
-
-        // Linear view-space distance, assuming DK64's near/far (10 / 1500 read
-        // from global_asm .data) and a standard [0,1] depth range.
-        //
-        // An earlier version of this printed two columns, labelled as the "GL"
-        // and "D3D" depth conventions, on the theory that comparing them against
-        // a known distance would reveal which one the backend uses. They are the
-        // same function:
-        //     2nf / ((f+n) - (2d-1)(f-n))
-        // has denominator 2(f - d(f-n)), so it reduces to nf / (f - d(f-n)).
-        // The two columns agreed in every sample because they could not disagree.
-        // Distinguishing a standard from a reversed depth range needs a
-        // known-distance observation, not a second algebraic form.
-        constexpr float nearZ = 10.0f;
-        constexpr float farZ = 1500.0f;
-        const float denom = farZ - (deviceDepth * (farZ - nearZ));
-        const float viewZ = (std::fabs(denom) > 1e-6f) ? ((nearZ * farZ) / denom) : -1.0f;
-
-        stereoDepthLogLine("device=%.6f  viewZ=%.1f", deviceDepth, viewZ);
     }
 
     // WorkloadQueue
@@ -923,9 +787,19 @@ namespace RT64 {
                             // convergence loop. Reusing that flag costs nothing
                             // and is a statement about the game rather than a
                             // guess about geometry.
+                            //
+                            // The scene classification alone proved insufficient:
+                            // the pause menu and the bananaport transition both
+                            // run inside Adventure mode with that flag clear, and
+                            // both draw reticle-shaped quads near the middle of
+                            // the screen, so both were being shifted to aim depth
+                            // and visibly corrupted. The game now reports whether
+                            // the first-person camera is live, which is the only
+                            // condition under which a reticle exists at all.
                             drawParams.stereoCrosshairValid = (stereoMode != UserConfiguration::StereoMode::Off) &&
                                 (stereoEye != StereoEye::None) && (separation > 0.0f) &&
-                                (ccfg.stereoSceneLowConvergence == 0);
+                                (ccfg.stereoSceneLowConvergence == 0) &&
+                                (ccfg.stereoSceneFirstPerson != 0);
                         }
                     }
                     framebufferRenderer->addFramebuffer(drawParams);
@@ -1104,7 +978,7 @@ namespace RT64 {
                     // time. Require the depth target to match the colour target's
                     // size, and let the sampler take only the first such pass per
                     // frame - reading back only when it actually sampled.
-                    if (stereoDepthSamplingEnabled()) {
+                    {
                         // Auxiliary passes are much smaller than the world pass;
                         // half the colour target's dimensions separates them
                         // without needing an exact match.
@@ -1121,10 +995,6 @@ namespace RT64 {
                               (depthTarget->height * 2 >= colorTarget->height)));
                         // Logged even when there is no depth target, so "no
                         // output" cannot be confused with "never reached".
-                        logStereoDepthCandidate((depthTarget != nullptr) ? depthTarget->width : 0,
-                            (depthTarget != nullptr) ? depthTarget->height : 0,
-                            (colorTarget != nullptr) ? colorTarget->width : 0,
-                            (colorTarget != nullptr) ? colorTarget->height : 0, mainPass);
                         if (mainPass) {
                             static StereoDepthSampler stereoDepthSampler;
                             static StereoAutoConvergence stereoAutoConvergence;
@@ -1142,7 +1012,6 @@ namespace RT64 {
                                 ((aimRect.top(false) + (aimRect.height(false, true) / 2)) * fixedResScale[1]));
                             if (stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget, aimCenterX, aimCenterY)) {
                                 const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
-                                logStereoDepthSample(sample.valid ? sample.medianDeviceDepth : -1.0f);
 
                                 // Invert the sampled depth with the projection
                                 // the frame was actually rendered with, rather
@@ -1154,7 +1023,6 @@ namespace RT64 {
                                     stereoGetWorldDepthTerms(projM22, projM32)) {
                                     const float aimZ = stereoDeviceDepthToViewZ(sample.medianDeviceDepth, projM22, projM32);
                                     stereoStoreCenterViewZ(aimZ);
-                                    logStereoAimDepth(aimZ);
                                     const float nearestZ = stereoDeviceDepthToViewZ(sample.nearestDeviceDepth, projM22, projM32);
                                     // Ceiling is the user's UNSCALED slider. Using
                                     // the effective value made the ceiling flicker
@@ -1164,8 +1032,6 @@ namespace RT64 {
                                         stereoAutoConvergence.update(nearestZ, cfg.stereoConvergenceManual, cfg.stereoSeparation,
                                             cfg.stereoComfortTarget, cfg.stereoSceneLowConvergence != 0),
                                         std::memory_order_relaxed);
-                                    logStereoAutoConvergence(nearestZ, cfg.stereoConvergenceManual,
-                                        stereoAutoConvergenceTenths.load(std::memory_order_relaxed));
                                 }
                                 else if (cfg.stereoAutoConvergence == 0) {
                                     // Snap back rather than easing out, so turning

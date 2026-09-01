@@ -56,244 +56,6 @@ namespace interop {
 };
 
 namespace RT64 {
-    // Temporary instrumentation for locating DK64's first-person crosshair.
-    //
-    // The crosshair is a small screen-space rectangle drawn at or very near the
-    // centre of the viewport. Everything else DK64 draws in screen space is
-    // either full-screen (the tints) or parked at the edges (HUD counters, text,
-    // the pause menu), so filtering to "small AND centred" should leave few
-    // candidates. Deduplicated by quantised geometry, so a long session still
-    // produces only a handful of lines.
-    //
-    // Set DK64_STEREO_XHAIR_LOG=0 to silence. Remove once the crosshair is
-    // identified.
-    static void logStereoCrosshairCandidate(const FixedRect &rect, const FixedRect &scissor) {
-        static const bool enabled = [] {
-            const char *v = std::getenv("DK64_STEREO_XHAIR_LOG");
-            return (v == nullptr) || ((v[0] != '\0') && (v[0] != '0'));
-        }();
-        if (!enabled) {
-            return;
-        }
-
-        const int32_t sw = scissor.width(false, true);
-        const int32_t sh = scissor.height(false, true);
-        const int32_t rw = rect.width(false, true);
-        const int32_t rh = rect.height(false, true);
-        if ((sw <= 0) || (sh <= 0) || (rw <= 0) || (rh <= 0)) {
-            return;
-        }
-
-        // Small: under a fifth of the viewport in both axes.
-        if ((rw * 5 > sw) || (rh * 5 > sh)) {
-            return;
-        }
-
-        // Centred: rect midpoint within a fifth of the viewport of the middle.
-        const int32_t rcx = rect.left(false) + (rw / 2);
-        const int32_t rcy = rect.top(false) + (rh / 2);
-        const int32_t scx = scissor.left(false) + (sw / 2);
-        const int32_t scy = scissor.top(false) + (sh / 2);
-        const int32_t dx = rcx - scx;
-        const int32_t dy = rcy - scy;
-        if (((dx < 0 ? -dx : dx) * 5 > sw) || ((dy < 0 ? -dy : dy) * 5 > sh)) {
-            return;
-        }
-
-        // Quantise so sub-pixel wobble as the reticle tracks does not emit a new
-        // line every frame.
-        using Key = std::tuple<int32_t, int32_t, int32_t, int32_t>;
-        static std::mutex mutex;
-        static std::set<Key> seen;
-        static uint32_t lines = 0;
-        const Key key{rw, rh, dx / 8, dy / 8};
-
-        std::lock_guard<std::mutex> lock(mutex);
-        if ((lines >= 200) || !seen.insert(key).second) {
-            return;
-        }
-        lines++;
-
-        char buf[192];
-        snprintf(buf, sizeof(buf), "rect %dx%d  offset from centre (%+d,%+d)  viewport %dx%d",
-            rw, rh, dx, dy, sw, sh);
-        fprintf(stderr, "[stereo-xhair] %s\n", buf);
-        FILE *f = fopen("stereo_crosshair.log", "a");
-        if (f != nullptr) {
-            fprintf(f, "%s\n", buf);
-            fclose(f);
-        }
-    }
-
-    // Companion to logStereoCrosshairCandidate for raw (pre-transformed)
-    // triangles, which is how DK64 draws its 2D sprites. The rectangle logger
-    // found only tiled logo and text content, so if the crosshair is a sprite it
-    // comes through here instead.
-    //
-    // The coordinate space of triPosFloats is not assumed: the bounding box is
-    // reported verbatim so it can be read off the log rather than guessed at.
-    static void logStereoCrosshairTriangles(const std::vector<float> &triPosFloats,
-                                            uint32_t rawVertexStart, uint32_t triangleCount) {
-        static const bool enabled = [] {
-            const char *v = std::getenv("DK64_STEREO_XHAIR_LOG");
-            return (v == nullptr) || ((v[0] != '\0') && (v[0] != '0'));
-        }();
-        // Path-usage counters first: a silent log should not be ambiguous
-        // between "this path never runs" and "the filter rejected everything".
-        {
-            static std::mutex countMutex;
-            static uint32_t calls = 0;
-            std::lock_guard<std::mutex> lock(countMutex);
-            calls++;
-            if ((calls == 1) || (calls == 1000) || (calls == 100000)) {
-                fprintf(stderr, "[stereo-xhair-tri] raw-triangle path reached %u times\n", calls);
-                FILE *cf = fopen("stereo_crosshair.log", "a");
-                if (cf != nullptr) {
-                    fprintf(cf, "PATH raw-triangle path reached %u times\n", calls);
-                    fclose(cf);
-                }
-            }
-        }
-
-        if (!enabled || (triangleCount == 0) || (triangleCount > 64)) {
-            return;
-        }
-
-        const uint32_t vertexEnd = rawVertexStart + (triangleCount * 3);
-        if ((size_t(vertexEnd) * 4) > triPosFloats.size()) {
-            return;
-        }
-
-        float minX = triPosFloats[size_t(rawVertexStart) * 4 + 0];
-        float maxX = minX;
-        float minY = triPosFloats[size_t(rawVertexStart) * 4 + 1];
-        float maxY = minY;
-        for (uint32_t v = rawVertexStart; v < vertexEnd; v++) {
-            const float x = triPosFloats[size_t(v) * 4 + 0];
-            const float y = triPosFloats[size_t(v) * 4 + 1];
-            minX = (x < minX) ? x : minX;
-            maxX = (x > maxX) ? x : maxX;
-            minY = (y < minY) ? y : minY;
-            maxY = (y > maxY) ? y : maxY;
-        }
-
-        using Key = std::tuple<int32_t, int32_t, int32_t, int32_t, uint32_t>;
-        static std::mutex mutex;
-        static std::set<Key> seen;
-        static uint32_t lines = 0;
-        const Key key{int32_t(minX / 4.0f), int32_t(minY / 4.0f),
-                      int32_t((maxX - minX) / 2.0f), int32_t((maxY - minY) / 2.0f), triangleCount};
-
-        std::lock_guard<std::mutex> lock(mutex);
-        if ((lines >= 200) || !seen.insert(key).second) {
-            return;
-        }
-        lines++;
-
-        char buf[192];
-        snprintf(buf, sizeof(buf), "tris=%u  bbox x[%.1f..%.1f] y[%.1f..%.1f]  size %.1fx%.1f",
-            triangleCount, minX, maxX, minY, maxY, maxX - minX, maxY - minY);
-        fprintf(stderr, "[stereo-xhair-tri] %s\n", buf);
-        FILE *f = fopen("stereo_crosshair.log", "a");
-        if (f != nullptr) {
-            fprintf(f, "TRI %s\n", buf);
-            fclose(f);
-        }
-    }
-
-    // Third attempt at locating DK64's first-person crosshair.
-    //
-    // It is not a texture rectangle (those turned out to be tiled logo and menu
-    // content) and not a raw triangle (that path never executes at all - zero
-    // calls across thousands of gameplay frames). By elimination it is ordinary
-    // indexed geometry drawn through the orthographic projection, which is also
-    // where every other HUD element lives.
-    //
-    // What separates them at that point is the MODELVIEW tag: DK64 sets
-    // cur_drawn_model_transform_id per model, so sprites, text and the rest each
-    // carry their own id (see interpolationIDs in patches/common_structs.h). The
-    // crosshair should appear as an id that shows up only while aiming.
-    //
-    // Set DK64_STEREO_XHAIR_LOG=0 to silence. Remove once identified.
-    static void logStereoOrthoModelTags(const DrawData &drawData, uint32_t minWorldMatrix,
-                                        uint32_t maxWorldMatrix, uint32_t triangleCount,
-                                        uint32_t faceIndicesStart) {
-        static const bool enabled = [] {
-            const char *v = std::getenv("DK64_STEREO_XHAIR_LOG");
-            return (v == nullptr) || ((v[0] != '\0') && (v[0] != '0'));
-        }();
-        if (!enabled) {
-            return;
-        }
-
-        for (uint32_t m = minWorldMatrix; m <= maxWorldMatrix; m++) {
-            if (m >= drawData.worldTransformGroups.size()) {
-                break;
-            }
-            const uint32_t groupIndex = drawData.worldTransformGroups[m];
-            if (groupIndex >= drawData.transformGroups.size()) {
-                continue;
-            }
-            const uint32_t matrixId = drawData.transformGroups[groupIndex].matrixId;
-
-            // Screen-space extent is what actually separates these: the tag
-            // alone cannot say which 2-triangle ortho sprite is the crosshair,
-            // but the crosshair is the one sitting at the middle of the screen.
-            float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
-            bool havePos = false;
-            const uint32_t indexEnd = faceIndicesStart + (triangleCount * 3);
-            for (uint32_t i = faceIndicesStart; (i < indexEnd) && (i < drawData.faceIndices.size()); i++) {
-                const uint32_t vtx = drawData.faceIndices[i];
-                if (vtx >= drawData.posScreen.size()) {
-                    continue;
-                }
-                const float px = drawData.posScreen[vtx].x;
-                const float py = drawData.posScreen[vtx].y;
-                if (!havePos) {
-                    minX = maxX = px;
-                    minY = maxY = py;
-                    havePos = true;
-                }
-                else {
-                    minX = (px < minX) ? px : minX;
-                    maxX = (px > maxX) ? px : maxX;
-                    minY = (py < minY) ? py : minY;
-                    maxY = (py > maxY) ? py : maxY;
-                }
-            }
-
-            // Bucket the triangle count and quantise the position, so a sprite
-            // that wobbles slightly does not emit a line per frame.
-            const uint32_t triBucket = (triangleCount <= 2) ? triangleCount : ((triangleCount <= 8) ? 8u : 64u);
-            using Key = std::tuple<uint32_t, uint32_t, int32_t, int32_t>;
-            static std::mutex mutex;
-            static std::set<Key> seen;
-            static uint32_t lines = 0;
-            const Key key{matrixId, triBucket, int32_t(minX / 16.0f), int32_t(minY / 16.0f)};
-
-            std::lock_guard<std::mutex> lock(mutex);
-            if ((lines >= 300) || !seen.insert(key).second) {
-                continue;
-            }
-            lines++;
-
-            char buf[200];
-            if (havePos) {
-                snprintf(buf, sizeof(buf), "ortho tag 0x%08X tris<=%u  screen x[%.0f..%.0f] y[%.0f..%.0f] size %.0fx%.0f",
-                    matrixId, triBucket, minX, maxX, minY, maxY, maxX - minX, maxY - minY);
-            }
-            else {
-                snprintf(buf, sizeof(buf), "ortho tag 0x%08X tris<=%u  (no screen positions)", matrixId, triBucket);
-            }
-            fprintf(stderr, "[stereo-xhair-tag] %s\n", buf);
-            FILE *f = fopen("stereo_crosshair.log", "a");
-            if (f != nullptr) {
-                fprintf(f, "TAG %s\n", buf);
-                fclose(f);
-            }
-        }
-    }
-
     // Matches the signature the crosshair search converged on: an UNTAGGED,
     // roughly square, modestly sized orthographic quad whose centre sits near
     // the middle of the screen.
@@ -1958,9 +1720,6 @@ namespace RT64 {
                             triangles.indexStart = triangles.vertexTestZ ? vertexTestZFaceIndicesStart : call.meshDesc.faceIndicesStart;
                             invRatioScale = projInvRatioScale;
                             if (proj.type == Projection::Type::Orthographic) {
-                                logStereoOrthoModelTags(drawData, call.callDesc.minWorldMatrix,
-                                    call.callDesc.maxWorldMatrix, call.callDesc.triangleCount,
-                                    call.meshDesc.faceIndicesStart);
 
                                 // Place the first-person crosshair at the depth
                                 // being aimed at rather than at HUD depth.
@@ -1971,7 +1730,27 @@ namespace RT64 {
                                 // this: it matches the geometry closely, but that
                                 // screen renders no world depth, so there is
                                 // nothing for it to match against.
-                                if (p.stereoCrosshairValid &&
+                                //
+                                // Sky projections are excluded outright. Creepy
+                                // Castle's moon is a two-triangle orthographic
+                                // sprite that can sit near the middle of the
+                                // frame, which is the whole of the geometric
+                                // description this test has to work with - so it
+                                // has to be ruled out by its projection tag
+                                // instead. It is given the at-infinity treatment
+                                // in the projection processor and must not then
+                                // be dragged back to aim depth here.
+                                const uint32_t projGroupIndex =
+                                    (proj.transformsIndex < drawData.viewProjTransformGroups.size())
+                                        ? drawData.viewProjTransformGroups[proj.transformsIndex]
+                                        : uint32_t(-1);
+                                const uint32_t projMatrixId =
+                                    (projGroupIndex < drawData.transformGroups.size())
+                                        ? drawData.transformGroups[projGroupIndex].matrixId
+                                        : uint32_t(0);
+                                const bool skyProjection = (projMatrixId == 0x00000004u);
+
+                                if (p.stereoCrosshairValid && !skyProjection &&
                                     stereoIsCrosshairCandidate(drawData, call.callDesc.minWorldMatrix,
                                         call.callDesc.maxWorldMatrix, call.callDesc.triangleCount,
                                         call.meshDesc.faceIndicesStart, fbPair.scissorRect)) {
@@ -2029,7 +1808,6 @@ namespace RT64 {
                                 triangles.screenOffset.x += p.stereoRectOffsetX;
                             }
 
-                            logStereoCrosshairCandidate(call.callDesc.rect, fbPair.scissorRect);
 
                             if (p.postBlendNoise) {
                                 // Indicate if post blend dither noise should be applied.
@@ -2050,8 +1828,6 @@ namespace RT64 {
                             // does. This catches sprites drawn via drawTris,
                             // including BK's zoombox bubble sprite.
                             triangles.screenOffset.x += p.stereoRectOffsetX;
-                            logStereoCrosshairTriangles(drawData.triPosFloats, call.meshDesc.rawVertexStart,
-                                call.callDesc.triangleCount);
                             break;
                         }
                         case Projection::Type::None:

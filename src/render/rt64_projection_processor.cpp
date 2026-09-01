@@ -87,64 +87,31 @@ namespace RT64 {
     // screen-space elements standing in for something infinitely far away, so
     // they belong at maximum positive parallax rather than on the screen plane.
     static constexpr uint32_t DK64_PROJECTION_AT_INFINITY_ID    = 0x00000700;
+    static constexpr uint32_t DK64_PROJECTION_WEATHER_ID        = 0x00000710;
 
     static bool isStereoInfinityProjectionId(uint32_t matrixId) {
         return (matrixId == DK64_PROJECTION_AT_INFINITY_ID);
     }
 
-    // Temporary stereo bring-up instrumentation. Set DK64_STEREO_PROJ_LOG=1 to
-    // append every distinct (matrixId, projection type) pair the frame graph
-    // produces to stereo_proj.log, together with how the stereo classifier
-    // treats it. Remove once the transform-ID map is settled.
-    // DK64 builds several different orthographic projections per frame (a 1x
-    // screen-space one, a 2x, a 4x used for text precision, and a
-    // character-select one) and they ALL carry the same matrixId, so keying the
-    // dedup on the id alone collapses them into a single line. Including the
-    // projection's own scale separates them, which is what lets a full-screen
-    // effect quad be told apart from HUD content drawn under the same tag.
-    static void logStereoProjectionId(uint32_t matrixId, bool isPerspective, float scaleX, float scaleY,
-                                      bool getsShear, bool getsViewShift, bool getsHudDepth) {
-        // Bring-up default is ON; set DK64_STEREO_PROJ_LOG=0 to silence it. The
-        // output is deduplicated, so it stays a handful of lines per session.
-        static const bool enabled = [] {
-            const char *v = std::getenv("DK64_STEREO_PROJ_LOG");
-            return (v == nullptr) || ((v[0] != '\0') && (v[0] != '0'));
-        }();
-        if (!enabled) {
-            return;
+    // At-infinity content, decided by projection TYPE as well as tag.
+    //
+    // Creepy Castle's moon is drawn as a two-triangle ORTHOGRAPHIC sprite
+    // carrying the skybox tag. Orthographic normally means 2D content, which put
+    // the moon on the screen plane, and at two triangles near the middle of the
+    // frame it could also satisfy the first-person reticle test and be dragged
+    // to aim depth. It is neither: it is sky, and sky belongs at maximum
+    // positive parallax.
+    //
+    // The same tag on a PERSPECTIVE projection is the sky dome, and DK64's sky
+    // functions do not restore the camera group afterwards, so world geometry
+    // inherits it too. Those must keep the world treatment - shear plus view
+    // shift - or the outdoor hub loses its convergence entirely. Hence the
+    // split on type rather than on tag alone.
+    static bool isStereoInfinityTarget(uint32_t matrixId, bool isOrtho) {
+        if (isStereoInfinityProjectionId(matrixId)) {
+            return true;
         }
-
-        // Key on everything we print, so a given ID is reported once per
-        // distinct classification rather than once ever - that way an ID whose
-        // treatment changes between areas still shows up.
-        // Quantise the scales so floating-point noise doesn't emit a new line
-        // every frame for what is really the same projection.
-        const int scaleKeyX = int(scaleX * 10000.0f);
-        const int scaleKeyY = int(scaleY * 10000.0f);
-        using Key = std::tuple<uint32_t, bool, int, int, bool, bool, bool>;
-        static std::mutex mutex;
-        static std::set<Key> seen;
-        const Key key{matrixId, isPerspective, scaleKeyX, scaleKeyY, getsShear, getsViewShift, getsHudDepth};
-
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!seen.insert(key).second) {
-            return;
-        }
-
-        FILE *f = fopen("stereo_proj.log", "a");
-        if (f == nullptr) {
-            return;
-        }
-        // For an orthographic projection m[0][0] is 2/(right-left), so the
-        // implied width in game units is 2/scaleX - a directly readable way to
-        // tell a 320-wide screen quad from a 1280-wide text projection.
-        const float impliedW = (scaleX != 0.0f) ? (2.0f / scaleX) : 0.0f;
-        const float impliedH = (scaleY != 0.0f) ? (2.0f / scaleY) : 0.0f;
-        fprintf(f, "matrixId=0x%08X %-13s scale=(%.5f,%.5f) implied=(%.1fx%.1f) shear=%d viewShift=%d hudDepth=%d\n",
-            matrixId, isPerspective ? "perspective" : "orthographic",
-            scaleX, scaleY, impliedW, impliedH,
-            getsShear ? 1 : 0, getsViewShift ? 1 : 0, getsHudDepth ? 1 : 0);
-        fclose(f);
+        return isOrtho && (matrixId == DK64_MTXTAG_SKYBOXBLEND);
     }
 
     static bool isStereoProjectionId(uint32_t matrixId) {
@@ -191,7 +158,8 @@ namespace RT64 {
     // perspective use is the sky geometry itself and keeps the world treatment.
     static bool isStereoScreenOverlayId(uint32_t matrixId) {
         return (matrixId == DK64_MTXTAG_FRAMEBUFFERTRANSITION) ||
-               (matrixId == DK64_MTXTAG_SKYBOXBLEND);
+               (matrixId == DK64_MTXTAG_SKYBOXBLEND) ||
+               (matrixId == DK64_PROJECTION_WEATHER_ID);
     }
 
     // Perspective-only HUD IDs, for menus or overlays the game draws in 3D.
@@ -231,7 +199,7 @@ namespace RT64 {
         (void)projScaleX;
         // At-infinity content gets its own treatment and must not also be given
         // the HUD depth shift.
-        if (isStereoInfinityProjectionId(matrixId)) {
+        if (isStereoInfinityTarget(matrixId, !isPerspective)) {
             return false;
         }
         if (isPerspective) {
@@ -580,17 +548,6 @@ namespace RT64 {
 
             adjustProjectionMatrix(projMatrix, projRatioScale);
 
-            // Temporary bring-up instrumentation, off unless DK64_STEREO_PROJ_LOG is set.
-            {
-                const bool dbgPersp = (proj.type == Projection::Type::Perspective);
-                const bool dbgOrtho = (proj.type == Projection::Type::Orthographic);
-                const bool dbgShear = dbgPersp && isStereoProjectionId(curProjGroup.matrixId);
-                const bool dbgView = dbgPersp && isStereoViewShiftProjectionId(curProjGroup.matrixId);
-                const bool dbgHud = isStereoHudTarget(curProjGroup.matrixId, dbgPersp, projMatrix[0][0]);
-                logStereoProjectionId(curProjGroup.matrixId, dbgPersp, projMatrix[0][0], projMatrix[1][1],
-                    dbgShear, dbgView, dbgHud);
-            }
-
             // Apply stereoscopic off-axis projection offset for world (gameplay)
             // and skybox projections.
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
@@ -609,7 +566,8 @@ namespace RT64 {
             // Place at-infinity content (the sun and its lens flare) at maximum
             // positive parallax so it sits behind all world geometry.
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
-                isStereoInfinityProjectionId(curProjGroup.matrixId)) {
+                isStereoInfinityTarget(curProjGroup.matrixId,
+                    proj.type == Projection::Type::Orthographic)) {
                 applyStereoInfinityShift(projMatrix, p.stereoEye, p.stereoSeparation,
                     proj.type == Projection::Type::Orthographic);
             }
@@ -660,7 +618,8 @@ namespace RT64 {
                 // follows produces a half-shifted matrix that jitters on every
                 // interpolated frame.
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
-                    isStereoInfinityProjectionId(curProjGroup.matrixId)) {
+                    isStereoInfinityTarget(curProjGroup.matrixId,
+                        proj.type == Projection::Type::Orthographic)) {
                     applyStereoInfinityShift(adjustedPrevProj, p.stereoEye, p.stereoSeparation,
                         proj.type == Projection::Type::Orthographic);
                 }
