@@ -53,7 +53,33 @@ namespace interop {
         // reordering, per the _pad0 note above.
         float2 rightVideoResolution;   // offset 40
         float2 rightTextureResolution; // offset 48
-        float2 rightContentOrigin;     // offset 56
+        float2 rightContentOrigin;     // offset 56 — closes the 64-byte chunk
+
+        // Ghost-reduction (anti-crosstalk) range compression, output3d 3.4.
+        // ghostContrast squeezes toward mid-grey, leaving (1-contrast)/2 of
+        // headroom at each end of the range; ghostBlackFloor raises the black
+        // floor only, which is where a cancelling display's own correction
+        // clips. 1.0 and 0.0 respectively are exact no-ops and the shader skips
+        // the math entirely at those values.
+        //
+        // Two floats land at 64 and 68, both inside the 64..80 chunk, so neither
+        // straddles a boundary — but they take the struct to 72 bytes, and the
+        // TAIL has to be padded out too.
+        //
+        // HLSL rounds a constant buffer up to a 16-byte multiple, so the shader
+        // side of this is 80 bytes (20 dwords) whatever C++ says. The D3D12
+        // backend sizes the root constants as ceil(sizeof / 4) = 18 dwords, and
+        // a root signature that declares fewer constants than the shader's
+        // cbuffer needs is rejected at pipeline creation. Padding to 80 makes
+        // the two agree.
+        //
+        // Per the _pad0 note above, a float2 added at 72 would also straddle the
+        // 80-byte boundary — so put any new vector after this padding, not
+        // before it.
+        float ghostContrast;      // offset 64
+        float ghostBlackFloor;    // offset 68
+        float _pad1;              // offset 72
+        float _pad2;              // offset 76 — closes the 80-byte chunk
     };
 #ifdef HLSL_CPU
 };

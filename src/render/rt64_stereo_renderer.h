@@ -74,6 +74,17 @@ namespace RT64 {
             // pillarbox through to the SbS output. Defaults to 1 (no
             // adjustment) which preserves the previous behavior.
             float aspectRatioScale = 1.0f;
+            // Ghost reduction (anti-crosstalk), output3d 3.4. 1.0 / 0.0 are
+            // exact no-ops and the shader skips the math at those values.
+            //
+            // BOTH the world compose and the UI overlay compose must receive
+            // the same pair. The remap is affine, so matching coefficients on
+            // both layers is what makes it equal one remap of the finished
+            // composite — and a bright HUD over a dark scene is exactly the
+            // content that ghosts worst, so forwarding to the world pass alone
+            // makes the sliders look like they do nothing.
+            float ghostContrast = 1.0f;
+            float ghostBlackFloor = 0.0f;
         };
 
         StereoRenderer();

@@ -49,7 +49,72 @@ namespace interop {
     };
 };
 
+#include "render/rt64_projection_processor.h"
+
 namespace RT64 {
+    // Aiming reticle identification, for the depth-aware crosshair.
+    //
+    // Matched on the TEXTURE rather than on where it sits: the reticle tracks
+    // its target and moves anywhere on screen, so no position or centredness
+    // test can name it. The texture is the one thing about it that does not
+    // change as it moves.
+    //
+    // cmdmenu_print runs texAnimateTexture over the reticle, so it cycles
+    // through several textures and each one hashes differently. All of the
+    // observed frames have to be listed: matching only some would make the
+    // crosshair track depth on those frames and snap back to HUD depth on the
+    // rest, which reads as a flicker rather than as a missing feature.
+    //
+    // Captured from the RT64 inspector. If a frame is ever missed, the
+    // diagnostic at the rect path reports unmatched square rects with their
+    // hashes so it can be added here.
+    static constexpr uint64_t StereoCrosshairTextureHashes[] = {
+        0x662c1f479081446eull,
+        0x0a6edb6a99a04b45ull,
+        0x15dc5f582b9f64c2ull,
+        0x26c5e6d8a350d9e1ull,
+        0x332c448e4d5cdff5ull,
+        0x9e7a34f89ba73c10ull,
+        0x65808b9ab5157580ull,
+    };
+
+    // Snap a per-eye NDC shift to a whole number of OUTPUT PIXELS.
+    //
+    // The N64 draws its text as point-sampled texture rectangles, so where a
+    // glyph lands relative to the pixel grid decides which source texel each
+    // output pixel takes. Two eyes shifted by equal and opposite fractions of a
+    // pixel therefore snap their texels differently, and the glyphs come out
+    // subtly different weights in each eye -- read as the font itself changing
+    // between the eyes rather than as a misalignment. The eyes cannot fuse that:
+    // there is no disparity to resolve, just two different renderings of the
+    // same letters.
+    //
+    // Landing both eyes on whole pixels makes the sampling phase identical, so
+    // each eye draws the same glyph and only its position differs. Quantization
+    // costs nothing perceptually: at a 1280-wide target one pixel is ~0.0016 of
+    // NDC, against a HUD range of tens of pixels.
+    static float stereoSnapNdcToPixel(float ndcOffset, float halfViewportWidth) {
+        if (halfViewportWidth < 1.0f) {
+            return ndcOffset;
+        }
+
+        const float ndcPerPixel = 1.0f / halfViewportWidth;
+        return std::round(ndcOffset / ndcPerPixel) * ndcPerPixel;
+    }
+
+    static bool stereoIsCrosshairTexture(uint64_t hash) {
+        if (hash == 0) {
+            return false;
+        }
+
+        for (uint64_t candidate : StereoCrosshairTextureHashes) {
+            if (candidate == hash) {
+                return true;
+            }
+        }
+
+        return false;
+    }
     // Helper functions.
     
     RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
@@ -1660,7 +1725,76 @@ namespace RT64 {
                             // rectangles. This makes screen-space text/UI
                             // shift in lockstep with the rest of the HUD when
                             // the HUD Depth slider is moved in stereo mode.
-                            triangles.screenOffset.x += p.stereoRectOffsetX;
+                            //
+                            // A rect spanning the full framebuffer WIDTH is
+                            // excluded. These are screen-space washes rather than
+                            // HUD elements: Dinosaur Planet's ScreenFade tints,
+                            // the fbfx transition and motion-blur blits, the
+                            // invisible aspect-ratio rect main.c draws, and the
+                            // full-width lightning flash band (rect 0 0 1280 312
+                            // over a 1280x960 target -- full width, top third).
+                            //
+                            // Width alone is the test, not width AND height. The
+                            // objection to shifting these is horizontal: a rect
+                            // already touching both screen edges cannot move
+                            // sideways without pulling its trailing edge inward,
+                            // uncovering a strip that the other eye still covers.
+                            // That strip is a bright seam the eyes rival over
+                            // instead of fusing. A full-width band also offers no
+                            // depth cue to carry -- there is no horizontal edge
+                            // left in frame whose disparity could be read -- so
+                            // the shift is pure cost. Height is irrelevant to
+                            // that argument, which is why a partial-height band
+                            // like the lightning must be caught too.
+                            //
+                            // Narrow elements are untouched and still move with
+                            // the HUD: Dino draws its gauges, icons and text as
+                            // small rects, none of which reach both edges.
+                            //
+                            // Deliberately not reusing coversScissorWidth above:
+                            // that one additionally demands regular origins,
+                            // which is the right question for aspect-ratio
+                            // correction but would let an edge-anchored wash slip
+                            // through here.
+                            const bool spansScissorWidth = (call.callDesc.rect.ulx <= fbPair.scissorRect.ulx) &&
+                                (call.callDesc.rect.lrx >= fbPair.scissorRect.lrx);
+                            // The aiming reticle takes the aim-depth shift in
+                            // place of the HUD one, and is identified by its
+                            // TEXTURE. It tracks its target and moves freely
+                            // across the screen, so nothing about its position
+                            // can name it -- but the texture does not change as
+                            // it moves.
+                            uint64_t rectTileHash = 0;
+                            if (call.callDesc.tileCount > 0) {
+                                rectTileHash = drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID;
+                            }
+
+                            const bool isCrosshair = p.stereoCrosshairValid && stereoIsCrosshairTexture(rectTileHash);
+                            if (isCrosshair) {
+                                // Snapped for the same reason as the HUD shift: the
+                                // reticle is a point-sampled rect too, and an
+                                // unsnapped shift makes its two eyes render subtly
+                                // different sprites. One pixel of quantization is
+                                // invisible against depth that changes continuously.
+                                triangles.screenOffset.x += stereoSnapNdcToPixel(p.stereoCrosshairOffsetX, halfViewportSize.x);
+
+                                // Report where it landed, in the 320x240 space the depth
+                                // sampler works in, so the NEXT frame samples depth under
+                                // the reticle. A frame behind is fine -- the aim depth is
+                                // EMA-smoothed over several frames anyway -- and it removes
+                                // any dependence on the game reporting its position.
+                                const int32_t rawW = fbPair.scissorRect.lrx - fbPair.scissorRect.ulx;
+                                const int32_t rawH = fbPair.scissorRect.lry - fbPair.scissorRect.uly;
+                                if ((rawW > 0) && (rawH > 0)) {
+                                    const int32_t cx = ((call.callDesc.rect.ulx + call.callDesc.rect.lrx) / 2) - fbPair.scissorRect.ulx;
+                                    const int32_t cy = ((call.callDesc.rect.uly + call.callDesc.rect.lry) / 2) - fbPair.scissorRect.uly;
+                                    stereoSetAimScreenPoint((cx * 320) / rawW, (cy * 240) / rawH);
+                                }
+                            }
+                            else
+                            if (!spansScissorWidth) {
+                                triangles.screenOffset.x += stereoSnapNdcToPixel(p.stereoRectOffsetX, halfViewportSize.x);
+                            }
 
                             if (p.postBlendNoise) {
                                 // Indicate if post blend dither noise should be applied.

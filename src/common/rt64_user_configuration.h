@@ -115,13 +115,45 @@ namespace RT64 {
         bool idleWorkActive;
         bool developerMode;
         StereoMode stereoMode;
-        // Slider value 0..100 set from the host application; converted to
-        // world-space units by the renderer.
+        // Slider values set from the host application; converted to clip-space
+        // separation / world-space convergence by the renderer.
+        //
+        // Separation is 0..100 and maps onto 0..0.10 of screen width. Under the
+        // clip-space parameterization it IS the projection shear, so the value
+        // is the background disparity the viewer actually sees, expressed in the
+        // same terms as the divergence ceiling that bounds it (~0.105 on a
+        // 27-inch 16:9 panel, lower on anything bigger).
+        //
+        // Convergence is in TENTHS of its slider, 1..1000 (= 0.1..100), so the
+        // slider can step below 1 without this bridge going floating point — and
+        // so the depth-driven loop's continuous solve does not quantise into
+        // visible steps.
         uint32_t stereoSeparation;
         uint32_t stereoConvergence;
         // HUD/textbox depth slider. 50 = screen plane (mono). Below 50 the HUD
         // is pushed behind the screen; above 50 it pops out toward the viewer.
+        // The resulting shift scales with stereoSeparation, so the HUD goes flat
+        // along with the world when the 3D effect is dialled to zero.
         uint32_t stereoHudDepth;
+        // Ghost-reduction (anti-crosstalk) range compression applied by the
+        // stereo compose shader. Every stereo display leaks part of each eye's
+        // image into the other, and how visible that leak is depends on the
+        // brightness difference between the eyes, so compressing the range
+        // before the image reaches the display reduces what's visible.
+        //   stereoGhostContrast:   0..100 percent. 100 = off (no squeeze).
+        //   stereoGhostBlackFloor: 0..100 percent. 0 = off (no lift).
+        // Both are exact no-ops at their defaults and the shader skips the math
+        // entirely when they are both there.
+        uint32_t stereoGhostContrast;
+        uint32_t stereoGhostBlackFloor;
+        // Non-zero while the user's Auto Convergence toggle is on. The
+        // depth-driven convergence loop is gated on this.
+        uint32_t stereoAutoConvergence;
+        // Comfort budget for the depth-driven convergence loop, in thousandths
+        // of screen width of permitted pop-out. SIGNED: 0 puts the screen plane
+        // exactly on the nearest object, and negative values pull it in FRONT of
+        // that object so the whole scene sits behind the glass.
+        int32_t stereoComfortTarget;
 
         UserConfiguration();
         void validate();

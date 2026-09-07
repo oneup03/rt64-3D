@@ -447,6 +447,18 @@ namespace RT64 {
                         const float resScaleX = static_cast<float>(resScale.x);
                         const float resScaleY = static_cast<float>(resScale.y);
                         stereoParams.aspectRatioScale = (resScaleY > 1e-6f) ? (resScaleX / resScaleY) : 1.0f;
+                        // Ghost reduction (output3d 3.4). The UI overlay pass
+                        // further down gets the SAME pair — the remap is affine,
+                        // so matching coefficients on both layers is what makes
+                        // it equal one remap of the finished composite. The
+                        // LeiaSR overlay params are a copy of these and inherit
+                        // it; the non-LeiaSR overlay params are built from
+                        // scratch and have to be told separately.
+                        {
+                            const auto &stereoCfg = ext.sharedResources->userConfig;
+                            stereoParams.ghostContrast = float(stereoCfg.stereoGhostContrast) / 100.0f;
+                            stereoParams.ghostBlackFloor = float(stereoCfg.stereoGhostBlackFloor) / 100.0f;
+                        }
 
 #                   ifdef LEIASR_SUPPORTED
                         // LeiaSR weaving requires D3D12 and the SR Platform
@@ -499,7 +511,17 @@ namespace RT64 {
                                 const uint32_t sbsW      = perEyeW * 2u;
                                 const uint32_t sbsH      = perEyeH;
                                 if ((leiaSRComposeTexture == nullptr) || (leiaSRComposeWidth != sbsW) || (leiaSRComposeHeight != sbsH)) {
-                                    const RenderFormat composeFormat = RenderFormat::R8G8B8A8_UNORM;
+                                    // Must match the render target format the StereoCompose
+                                    // pipelines are created with (ShaderLibrary hardcodes
+                                    // B8G8R8A8_UNORM, the swap chain format). D3D12 requires the
+                                    // PSO's RTVFormats to equal the bound render target's format,
+                                    // so an R8G8B8A8 intermediate makes both composes below --
+                                    // the SbS world pass and the UI overlay pass that re-binds
+                                    // this same target -- a validation error at draw time. That
+                                    // is invisible in release (no debug layer) but breaks
+                                    // instantly in a debug build, and leaves the weaver reading
+                                    // channel-swapped input either way.
+                                    const RenderFormat composeFormat = RenderFormat::B8G8R8A8_UNORM;
                                     RenderClearValue composeClear = RenderClearValue::Color(RenderColor(0.0f, 0.0f, 0.0f, 1.0f), composeFormat);
                                     leiaSRComposeTexture = ext.device->createTexture(RenderTextureDesc::ColorTarget(sbsW, sbsH, composeFormat, RenderMultisampling(), &composeClear));
                                     const RenderTexture *composeAttachment = leiaSRComposeTexture.get();
@@ -706,6 +728,8 @@ namespace RT64 {
                         overlayParams.vi = &present.screenVI;
                         overlayParams.removeBlackBorders = removeBlackBorders;
                         overlayParams.isUIOverlay = true;
+                        overlayParams.ghostContrast = float(ext.sharedResources->userConfig.stereoGhostContrast) / 100.0f;
+                        overlayParams.ghostBlackFloor = float(ext.sharedResources->userConfig.stereoGhostBlackFloor) / 100.0f;
                         stereoRenderer->render(overlayParams);
                     }
                     else {

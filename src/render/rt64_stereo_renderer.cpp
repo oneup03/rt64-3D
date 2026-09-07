@@ -169,6 +169,8 @@ namespace RT64 {
         }
         pushConstants.stereoMode = static_cast<uint32_t>(shaderStereoMode);
         pushConstants.useUIOverlayMode = p.isUIOverlay ? 1u : 0u;
+        pushConstants.ghostContrast = p.ghostContrast;
+        pushConstants.ghostBlackFloor = p.ghostBlackFloor;
 
         p.commandList->setPipeline(shader->pipeline.get());
         p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());

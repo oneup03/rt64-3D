@@ -153,6 +153,13 @@ namespace RT64 {
             // of the HUD as the user moves the HUD Depth slider. Zero when
             // stereo is off.
             float stereoRectOffsetX = 0.0f;
+            // Depth-aware crosshair (dynamic3d 5.1). The rect drawing the aiming
+            // reticle gets stereoCrosshairOffsetX INSTEAD of stereoRectOffsetX, so
+            // it sits at the depth being aimed at rather than flat at HUD depth.
+            // The reticle is identified by its TEXTURE in the rect path -- it moves
+            // freely across the screen, so no position test can name it.
+            bool stereoCrosshairValid = false;
+            float stereoCrosshairOffsetX = 0.0f;
         };
 
         FramebufferRenderer(RenderWorker *worker, bool rtSupport, UserConfiguration::GraphicsAPI graphicsAPI, const ShaderLibrary *shaderLibrary);

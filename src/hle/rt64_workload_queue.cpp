@@ -4,6 +4,8 @@
 
 #include "rt64_workload_queue.h"
 
+#include "render/rt64_stereo_depth_sampler.h"
+
 #include "common/rt64_thread.h"
 
 #include "rt64_present_queue.h"
@@ -11,6 +13,27 @@
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
 
 namespace RT64 {
+    // Convergence the depth-driven loop solved for, in the same tenths unit as
+    // the user's slider. Zero means "nothing to say" — the loop has not run, or
+    // has been reset.
+    //
+    // TWO values, and the split is load-bearing. threadRenderFrame runs once per
+    // eye, and the depth-sampling pass sits LATER in it than the projection
+    // setup — so the left eye's pass updates the solve before the right eye's
+    // projection setup reads it. Reading one value from both would hand the two
+    // eyes different convergence within a single frame, which breaks stereo
+    // outright (the same trap the deleted FOV auto-scale had to avoid).
+    //
+    // So: the depth pass publishes into `pending`, and the projection setup
+    // promotes pending -> applied only on the pass that is NOT the right eye.
+    // Both eyes of a pair then read one latched value.
+    //
+    // Both live on the render thread and are only ever touched from it, so
+    // relaxed atomics are enough. They are deliberately NOT part of userConfig:
+    // that is the user's saved state, and this is a per-frame derived value.
+    static std::atomic<uint32_t> stereoAutoConvergencePendingTenths{0};
+    static std::atomic<uint32_t> stereoAutoConvergenceAppliedTenths{0};
+
     // WorkloadQueue
 
     WorkloadQueue::WorkloadQueue() {
@@ -320,6 +343,23 @@ namespace RT64 {
             projParams.stereoMode = stereoMode;
             projParams.stereoSeparation = ext.sharedResources->userConfig.stereoSeparation;
             projParams.stereoConvergence = ext.sharedResources->userConfig.stereoConvergence;
+
+            // Depth-driven auto-convergence overrides the manual value when it
+            // has something to say. It only ever pulls convergence IN — the
+            // manual slider stays the ceiling — so this cannot push the screen
+            // plane further out than the user asked for.
+            if (ext.sharedResources->userConfig.stereoAutoConvergence != 0) {
+                // Latch on the first pass of the pair so both eyes see one value.
+                if (stereoEye != StereoEye::Right) {
+                    stereoAutoConvergenceAppliedTenths.store(
+                        stereoAutoConvergencePendingTenths.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+                }
+                const uint32_t autoTenths = stereoAutoConvergenceAppliedTenths.load(std::memory_order_relaxed);
+                if (autoTenths > 0) {
+                    projParams.stereoConvergence = std::min(autoTenths, projParams.stereoConvergence);
+                }
+            }
             projParams.stereoHudDepth = ext.sharedResources->userConfig.stereoHudDepth;
             // Caller selects which eye this pass renders. The two-pass driver in
             // renderThreadLoop runs this function twice with Left then Right when
@@ -659,8 +699,42 @@ namespace RT64 {
                     drawParams.stereoRectOffsetX = 0.0f;
                     if (stereoMode != UserConfiguration::StereoMode::Off) {
                         drawParams.stereoRectOffsetX = stereoHudRectOffsetX(
-                            stereoEye, ext.sharedResources->userConfig.stereoHudDepth);
+                            stereoEye, ext.sharedResources->userConfig.stereoHudDepth,
+                            ext.sharedResources->userConfig.stereoSeparation);
                     }
+                    // Depth-aware crosshair (dynamic3d 5.1). The reticle is a
+                    // texture rectangle, so it normally rides the HUD shift
+                    // applied to every rect. Give it the shift for the depth
+                    // under the aim point instead -- REPLACING the HUD one, which
+                    // is why the renderer picks one or the other rather than
+                    // summing them.
+                    //
+                    // The offset is computed unconditionally while stereo is on,
+                    // NOT gated on having an aim point. The renderer identifies
+                    // the reticle by texture and reports its position back for the
+                    // next frame, so gating this on already having a position
+                    // would deadlock: no valid flag means no match, and no match
+                    // means no position is ever reported.
+                    if (stereoMode != UserConfiguration::StereoMode::Off) {
+                        const auto &acfg = ext.sharedResources->userConfig;
+
+                        // The effective convergence, matching what the world
+                        // projection was actually sheared with -- otherwise the
+                        // reticle zero-parallax distance drifts away from the
+                        // scene whenever auto-convergence pulls in.
+                        uint32_t aimConvTenths = acfg.stereoConvergence;
+                        if (acfg.stereoAutoConvergence != 0) {
+                            const uint32_t autoTenths = stereoAutoConvergenceAppliedTenths.load(std::memory_order_relaxed);
+                            if (autoTenths > 0) {
+                                aimConvTenths = std::min(autoTenths, aimConvTenths);
+                            }
+                        }
+
+                        drawParams.stereoCrosshairOffsetX = stereoAimRectOffsetX(
+                            stereoEye, stereoLoadAimViewZ(), acfg.stereoSeparation, aimConvTenths);
+                        drawParams.stereoCrosshairValid = true;
+                    }
+
                     framebufferRenderer->addFramebuffer(drawParams);
                 }
                 
@@ -825,6 +899,175 @@ namespace RT64 {
                     else {
                         RenderTarget *chosenTarget = (colorTarget != nullptr) ? colorTarget : depthTarget;
                         ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(chosenTarget->texture.get(), RenderTextureLayout::SHADER_READ));
+                    }
+
+                    // Depth-driven auto-convergence (dynamic3d 4). Sample the
+                    // depth buffer once per frame and feed the control loop.
+                    //
+                    // This runs once per framebuffer PAIR and a frame has several
+                    // — the world pass plus smaller auxiliary ones whose depth is
+                    // empty — so sampling every pair produces a stream that is
+                    // invalid most of the time. Require the depth target to be
+                    // roughly the colour target's size, which separates the world
+                    // pass from the much smaller auxiliary ones without needing an
+                    // exact match, and let the sampler take only the first such
+                    // pass per frame.
+                    //
+                    // Only the LEFT eye is sampled. In stereo the world is
+                    // rendered twice and both passes produce a full-size depth
+                    // target, so taking both would interleave two series that
+                    // differ by the eye disparity — enough to make convergence
+                    // jitter every frame.
+                    {
+                        static StereoDepthSampler stereoDepthSampler;
+                        static StereoAutoConvergence stereoAutoConvergence;
+                        const auto &cfg = ext.sharedResources->userConfig;
+                        const bool stereoOn = (cfg.stereoMode != UserConfiguration::StereoMode::Off);
+                        const bool autoConvergenceOn = stereoOn && (cfg.stereoAutoConvergence != 0);
+                        // The game republishes the reticle position every frame, so
+                        // a non-negative x means one is on screen right now.
+                        int32_t aimScreenX = -1;
+                        int32_t aimScreenY = -1;
+                        const bool aimActive = stereoOn && stereoGetAimScreenPoint(aimScreenX, aimScreenY);
+                        // The crosshair needs depth whether or not auto-convergence
+                        // is on, so the sampler is no longer gated on that alone.
+                        const bool wantDepth = autoConvergenceOn || aimActive;
+                        const bool sampledEye = (stereoEye != StereoEye::Right);
+                        const bool mainPass = wantDepth && sampledEye && (depthTarget != nullptr) &&
+                            ((colorTarget == nullptr) ||
+                             ((depthTarget->width * 2 >= colorTarget->width) &&
+                              (depthTarget->height * 2 >= colorTarget->height)));
+                        if (mainPass) {
+                            // Map the reticle from the game's 320x240 screen space
+                            // onto depth-target texels through the frame's own
+                            // scissor rather than the target's dimensions: the
+                            // target is grown and never shrunk and carries a
+                            // horizontal misalignment, so its midpoint is not the
+                            // middle of what was actually drawn.
+                            int32_t aimTexelX = -1;
+                            int32_t aimTexelY = -1;
+                            if (aimActive) {
+                                // The reported point is already absolute in 320x240
+                                // screen space, so it only needs the resolution
+                                // scale to become depth texels -- no scissor origin
+                                // term, which would double-count it. misalignX backs
+                                // out the target padding, the same correction the
+                                // rest of the target maths applies.
+                                {
+                                    aimTexelX = int32_t(float(aimScreenX) * fixedResScale[0]) - depthTarget->misalignX;
+                                    aimTexelY = int32_t(float(aimScreenY) * fixedResScale[1]);
+
+                                    // Compensate for WHICH EYE this depth target
+                                    // belongs to.
+                                    //
+                                    // Only the left eye is sampled, and the left
+                                    // eye is not the centre view: everything in it
+                                    // is displaced horizontally by the disparity
+                                    // for its own depth. The reticle position is in
+                                    // undisplaced HUD space, so sampling there
+                                    // reads a column of the scene offset to one
+                                    // side of what the player is actually pointing
+                                    // at. The error is largest for distant
+                                    // geometry, where disparity is largest, and it
+                                    // is one-sided: an object is detected earlier
+                                    // when approached from one direction than the
+                                    // other.
+                                    //
+                                    // The world content that appears at HUD x in
+                                    // this eye sits at x plus that eye shift, which
+                                    // is the SAME quantity the crosshair itself is
+                                    // moved by -- so reuse it rather than deriving
+                                    // a second expression whose sign could drift
+                                    // from the first.
+                                    //
+                                    // Uses the previous frame depth, since the
+                                    // shift depends on the depth being measured.
+                                    // That circularity settles in a frame or two
+                                    // and the aim depth is EMA-smoothed anyway.
+                                    const float prevAimZ = stereoLoadAimViewZ();
+                                    if (prevAimZ > 0.0f) {
+                                        uint32_t eyeConvTenths = cfg.stereoConvergence;
+                                        if (cfg.stereoAutoConvergence != 0) {
+                                            const uint32_t autoTenths = stereoAutoConvergenceAppliedTenths.load(std::memory_order_relaxed);
+                                            if (autoTenths > 0) {
+                                                eyeConvTenths = std::min(autoTenths, eyeConvTenths);
+                                            }
+                                        }
+
+                                        // screenOffset is in NDC, where the full
+                                        // target width spans 2.
+                                        const float eyeNdc = stereoAimRectOffsetX(stereoEye, prevAimZ,
+                                            cfg.stereoSeparation, eyeConvTenths);
+                                        aimTexelX += int32_t(eyeNdc * float(depthTarget->width) * 0.5f);
+                                    }
+                                    aimTexelX = std::clamp(aimTexelX, 0, int32_t(depthTarget->width) - 1);
+                                    aimTexelY = std::clamp(aimTexelY, 0, int32_t(depthTarget->height) - 1);
+                                }
+                            }
+
+                            if (stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget, aimTexelX, aimTexelY)) {
+                                const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
+
+                                // Invert the sampled depth with the projection the
+                                // frame was actually rendered with, rather than
+                                // assuming a fixed near/far: camSetFOV and the
+                                // gFarPlane lerp both move it at runtime.
+                                float projM22 = 0.0f;
+                                float projM32 = 0.0f;
+                                float vpScaleZ = 0.0f;
+                                float vpTranslateZ = 0.0f;
+                                if (stereoGetWorldDepthTerms(projM22, projM32, vpScaleZ, vpTranslateZ)) {
+                                    if (sample.valid && autoConvergenceOn) {
+                                        const float nearestZ = stereoDeviceDepthToViewZ(sample.nearestDeviceDepth, projM22, projM32, vpScaleZ, vpTranslateZ);
+                                        stereoAutoConvergencePendingTenths.store(
+                                            stereoAutoConvergence.update(nearestZ, cfg.stereoConvergence, cfg.stereoSeparation,
+                                                cfg.stereoComfortTarget),
+                                            std::memory_order_relaxed);
+                                    }
+
+                                    // Aim depth for the crosshair (dynamic3d 5.1):
+                                    // the sampler's spatial median, then a temporal
+                                    // EMA behind a RELATIVE deadband. A fixed-unit
+                                    // deadband would be simultaneously too twitchy
+                                    // up close and too sluggish at range. Symmetric
+                                    // rates, unlike the convergence loop: there is
+                                    // no comfort asymmetry to respect here, only
+                                    // the wish that the reticle not jitter.
+                                    static float aimZEma = -1.0f;
+                                    if (sample.aimValid) {
+                                        const float aimZ = stereoDeviceDepthToViewZ(sample.aimDeviceDepth, projM22, projM32, vpScaleZ, vpTranslateZ);
+                                        if (aimZ > 0.0f) {
+                                            if (aimZEma <= 0.0f) {
+                                                aimZEma = aimZ;
+                                            }
+                                            else if ((std::fabs(aimZ - aimZEma) / aimZEma) > 0.01f) {
+                                                aimZEma += (aimZ - aimZEma) * 0.25f;
+                                            }
+
+                                            stereoStoreAimViewZ(aimZEma);
+                                        }
+                                    }
+                                    else {
+                                        // Drop the history rather than hold a stale
+                                        // depth: the next reticle may be somewhere
+                                        // else entirely, and easing across from the
+                                        // last one would drift visibly.
+                                        aimZEma = -1.0f;
+                                        stereoStoreAimViewZ(-1.0f);
+                                    }
+                                }
+                            }
+                        }
+                        else if (!autoConvergenceOn && sampledEye) {
+                            // Snap back rather than easing out, so turning the
+                            // feature off is immediate (dynamic3d 4.5). Costs
+                            // nothing while it is off — no copy is queued and no
+                            // readback happens, which is also why the whole block
+                            // is gated rather than left running.
+                            stereoAutoConvergence.reset();
+                            stereoAutoConvergencePendingTenths.store(0, std::memory_order_relaxed);
+                            stereoAutoConvergenceAppliedTenths.store(0, std::memory_order_relaxed);
+                        }
                     }
 
                     // Do the resolve if using MSAA while target override is active and we're on the correct framebuffer pair index.

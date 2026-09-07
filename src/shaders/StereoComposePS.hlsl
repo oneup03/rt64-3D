@@ -44,6 +44,44 @@ float4 SampleEye(Texture2D<float4> tex, float2 uv, float2 videoRes, float2 texRe
     return gammaCorrectedColor;
 }
 
+// Ghost reduction (anti-crosstalk), output3d 3.4.
+//
+// Every stereo display leaks part of each eye's image into the other, and how
+// visible that leak is depends on the brightness difference between the eyes —
+// so compressing the range before the image reaches the display reduces what
+// you see. Some displays (autostereoscopic panels in particular) additionally
+// CANCEL crosstalk by pre-subtracting a fraction of the opposite eye; that
+// inversion drives values past the ends of the range, where the render target
+// clamps them, and the clamped part is what survives as a ghost.
+//
+//   contrast: squeezes toward mid-grey, shrinking |L - R| directly and leaving
+//             (1-contrast)/2 of headroom at each end. Costs contrast across the
+//             whole image. 1.0 = off.
+//   lift:     raises the black floor and leaves white alone, which is where
+//             cancellation clips. Costs black level. 0.0 = off. Only helps on
+//             displays that actually cancel.
+//
+// No gamma decode here on purpose: this runs on values already in the encoding
+// we hand the display, and the LeiaSR weaver is created with SRGB conversion
+// off — it cancels in exactly these values, so we must pivot around 0.5 in the
+// same space rather than in linear light. Being "more correct" than the runtime
+// only desynchronises the two.
+//
+// The remap is affine, and an affine remap commutes exactly with alpha blending
+// as long as both layers get the same coefficients. That is what lets the UI
+// overlay pass apply it to its own samples and still land on the same result as
+// one remap over the finished composite — which matters, because a bright HUD
+// over a dark scene is the content that ghosts worst.
+float3 GhostReduce(float3 c) {
+    if ((gConstants.ghostContrast >= 1.0f) && (gConstants.ghostBlackFloor <= 0.0f)) {
+        return c;
+    }
+    float3 v = saturate(c);
+    v = (v - 0.5f) * gConstants.ghostContrast + 0.5f;
+    v = v * (1.0f - gConstants.ghostBlackFloor) + gConstants.ghostBlackFloor;
+    return saturate(v);
+}
+
 float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
     // Default: pass through left eye (matches VideoInterfacePSRegular behavior so
     // that any unrecognized mode produces a usable mono frame instead of black).
@@ -106,7 +144,9 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
         // screen would blank out. Sidestep the mix in UI mode and return the
         // UI sample untouched so the overlay blends normally.
         if (gConstants.useUIOverlayMode != 0) {
-            return SampleEye(gLeftEye, leftSampleUv, gConstants.videoResolution, gConstants.textureResolution, gConstants.contentOrigin);
+            float4 uiColor = SampleEye(gLeftEye, leftSampleUv, gConstants.videoResolution, gConstants.textureResolution, gConstants.contentOrigin);
+            uiColor.rgb = GhostReduce(uiColor.rgb);
+            return uiColor;
         }
         // Red-cyan anaglyph using a full cross-talk RGB matrix. Each output
         // channel takes weighted contributions from BOTH eyes (positive from
@@ -123,10 +163,11 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
                            + 0.377 * cB.r + 0.761 * cB.g + 0.009 * cB.b);
         float b = saturate(-0.048 * cA.r - 0.050 * cA.g - 0.017 * cA.b
                            - 0.026 * cB.r - 0.093 * cB.g + 1.234 * cB.b);
-        return float4(r, g, b, 1.0f);
+        return float4(GhostReduce(float3(r, g, b)), 1.0f);
     }
-    if (useRight) {
-        return SampleEye(gRightEye, rightSampleUv, gConstants.rightVideoResolution, gConstants.rightTextureResolution, gConstants.rightContentOrigin);
-    }
-    return SampleEye(gLeftEye, leftSampleUv, gConstants.videoResolution, gConstants.textureResolution, gConstants.contentOrigin);
+    float4 outColor = useRight
+        ? SampleEye(gRightEye, rightSampleUv, gConstants.rightVideoResolution, gConstants.rightTextureResolution, gConstants.rightContentOrigin)
+        : SampleEye(gLeftEye, leftSampleUv, gConstants.videoResolution, gConstants.textureResolution, gConstants.contentOrigin);
+    outColor.rgb = GhostReduce(outColor.rgb);
+    return outColor;
 }

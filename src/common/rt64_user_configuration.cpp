@@ -33,6 +33,10 @@ namespace RT64 {
         j["stereoSeparation"] = cfg.stereoSeparation;
         j["stereoConvergence"] = cfg.stereoConvergence;
         j["stereoHudDepth"] = cfg.stereoHudDepth;
+        j["stereoGhostContrast"] = cfg.stereoGhostContrast;
+        j["stereoGhostBlackFloor"] = cfg.stereoGhostBlackFloor;
+        j["stereoAutoConvergence"] = cfg.stereoAutoConvergence;
+        j["stereoComfortTarget"] = cfg.stereoComfortTarget;
     }
 
     void from_json(const json &j, UserConfiguration &cfg) {
@@ -60,6 +64,10 @@ namespace RT64 {
         cfg.stereoSeparation = j.value("stereoSeparation", defaultCfg.stereoSeparation);
         cfg.stereoConvergence = j.value("stereoConvergence", defaultCfg.stereoConvergence);
         cfg.stereoHudDepth = j.value("stereoHudDepth", defaultCfg.stereoHudDepth);
+        cfg.stereoGhostContrast = j.value("stereoGhostContrast", defaultCfg.stereoGhostContrast);
+        cfg.stereoGhostBlackFloor = j.value("stereoGhostBlackFloor", defaultCfg.stereoGhostBlackFloor);
+        cfg.stereoAutoConvergence = j.value("stereoAutoConvergence", defaultCfg.stereoAutoConvergence);
+        cfg.stereoComfortTarget = j.value("stereoComfortTarget", defaultCfg.stereoComfortTarget);
     }
 
     template <typename T>
@@ -92,9 +100,15 @@ namespace RT64 {
         idleWorkActive = true;
         developerMode = false;
         stereoMode = StereoMode::Off;
-        stereoSeparation = 50;
-        stereoConvergence = 20;
+        // 18 -> 0.018 of screen width, which is what the previous world-units
+        // form produced at its own defaults on a 16:9 window.
+        stereoSeparation = 18;
+        stereoConvergence = 200;   // tenths -> 20.0, i.e. 200 game units
         stereoHudDepth = 35;
+        stereoGhostContrast = 100;
+        stereoGhostBlackFloor = 0;
+        stereoAutoConvergence = 0;
+        stereoComfortTarget = 5;
     }
 
     void UserConfiguration::validate() {
@@ -111,8 +125,12 @@ namespace RT64 {
         clampEnum<HardwareResolve>(hardwareResolve);
         clampEnum<StereoMode>(stereoMode);
         stereoSeparation = std::clamp<uint32_t>(stereoSeparation, 0, 100);
-        stereoConvergence = std::clamp<uint32_t>(stereoConvergence, 1, 100);
+        stereoConvergence = std::clamp<uint32_t>(stereoConvergence, 1, 1000);
         stereoHudDepth = std::clamp<uint32_t>(stereoHudDepth, 0, 100);
+        stereoGhostContrast = std::clamp<uint32_t>(stereoGhostContrast, 0, 100);
+        stereoGhostBlackFloor = std::clamp<uint32_t>(stereoGhostBlackFloor, 0, 100);
+        stereoAutoConvergence = (stereoAutoConvergence != 0) ? 1 : 0;
+        stereoComfortTarget = std::clamp<int32_t>(stereoComfortTarget, -50, 60);
         resolutionMultiplier = std::clamp<double>(resolutionMultiplier, 0.0f, ResolutionMultiplierLimit);
         downsampleMultiplier = std::clamp<int>(downsampleMultiplier, 1, ResolutionMultiplierLimit);
         aspectTarget = std::clamp<double>(aspectTarget, 0.1f, 100.0f);
