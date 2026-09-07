@@ -231,7 +231,36 @@ namespace RT64 {
 #       ifdef _WIN32
                 D3D12CommandList *interfaceCommandList = static_cast<D3D12CommandList *>(commandList);
                 interfaceCommandList->checkDescriptorHeaps();
+
+                // ImGui's DX12 backend trips a D3D12 validation ERROR that has not
+                // been tracked down yet. A debug build sets the layer to break on
+                // errors, so opening the inspector halts the debugger on the spot
+                // and the tool is unusable exactly when it is most wanted.
+                //
+                // Lift the break around ImGui's own draws ONLY, rather than turning
+                // it off for the whole build. The game's rendering keeps breaking on
+                // its own errors, which is the reason the setting exists; the
+                // message is still emitted to the debug output either way, so this
+                // hides nothing that was not already visible there.
+                //
+                // The previous value is restored rather than assumed, so this stays
+                // correct whatever the build configured -- and in a release build
+                // there is no info queue at all and the whole thing is skipped.
+                ID3D12InfoQueue *infoQueue = nullptr;
+                BOOL previousBreakOnError = FALSE;
+                D3D12Device *interfaceDevice = static_cast<D3D12Device *>(device);
+                if ((interfaceDevice != nullptr) && (interfaceDevice->d3d != nullptr) &&
+                    SUCCEEDED(interfaceDevice->d3d->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
+                    previousBreakOnError = infoQueue->GetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR);
+                    infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+                }
+
                 ImGui_ImplDX12_RenderDrawData(drawData, interfaceCommandList->d3d);
+
+                if (infoQueue != nullptr) {
+                    infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, previousBreakOnError);
+                    infoQueue->Release();
+                }
 #       else
                 assert(false && "Unsupported Graphics API.");
 #       endif
