@@ -43,6 +43,16 @@ namespace RT64 {
         // True if initialize() succeeded and the weaver is ready to weave.
         bool isAvailable() const;
 
+        // Express this process's preference for the panel's switchable
+        // lenticular lens, on the displays that have one. Drive it from whether
+        // a frame actually WOVE rather than from which output mode is selected;
+        // the reasoning is at the call site in the present queue.
+        //
+        // Cheap to call every present: an unchanged preference never reaches the
+        // SDK, and on a machine with no SR runtime a release that was never
+        // matched by an enable does not touch the SDK at all.
+        void setLensHint(bool enable);
+
         // Configures the weaver for a single weave() call:
         //   - inputTexture: SbS-packed stereo image. Must be in SHADER_READ.
         //     Its dimensions and format are read from the resource desc, so
