@@ -1386,6 +1386,22 @@ namespace RT64 {
         
         // Setup framebuffer pair data and descriptor set.
         const FramebufferPair &fbPair = p.curWorkload->fbPairs[p.fbPairIndex];
+
+        // No pair in this whole frame reads or writes the Z-buffer, so it is a flat
+        // presentation screen -- the file select, which draws itself as a stack of
+        // full-width one-pixel strips, and the tiled full-screen images -- and not a
+        // world with a HUD over it.
+        //
+        // Every draw in such a frame stays on the screen plane. That includes the
+        // narrow rects which would normally travel with the HUD: on a screen that IS
+        // the interface there is no separate HUD layer to sit in front of, and
+        // splitting a few elements out of an otherwise flat image only breaks it.
+        //
+        // Asked of the frame and not of fbPair for the reason spelled out on
+        // Workload::anyDepthUsed -- a mid-gameplay pair holding only Z-disabled
+        // draws is indistinguishable from a menu screen when looked at alone.
+        // The projection side of the same rule is in ProjectionProcessor.
+        const bool flatPresentationFrame = !p.curWorkload->anyDepthUsed();
         interop::FramebufferParams fbParams;
         fbParams.resolution = { p.targetWidth / p.resolutionScale.x, p.targetHeight / p.resolutionScale.y };
         fbParams.resolutionScale = p.resolutionScale;
@@ -1769,7 +1785,7 @@ namespace RT64 {
                                 rectTileHash = drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID;
                             }
 
-                            const bool isCrosshair = p.stereoCrosshairValid && stereoIsCrosshairTexture(rectTileHash);
+                            const bool isCrosshair = !flatPresentationFrame && p.stereoCrosshairValid && stereoIsCrosshairTexture(rectTileHash);
                             if (isCrosshair) {
                                 // Snapped for the same reason as the HUD shift: the
                                 // reticle is a point-sampled rect too, and an
@@ -1792,7 +1808,7 @@ namespace RT64 {
                                 }
                             }
                             else
-                            if (!spansScissorWidth) {
+                            if (!spansScissorWidth && !flatPresentationFrame) {
                                 triangles.screenOffset.x += stereoSnapNdcToPixel(p.stereoRectOffsetX, halfViewportSize.x);
                             }
 
@@ -1814,7 +1830,9 @@ namespace RT64 {
                             // to screenOffset.x, the same way the Rectangle path
                             // does. This catches sprites drawn via drawTris,
                             // including BK's zoombox bubble sprite.
-                            triangles.screenOffset.x += p.stereoRectOffsetX;
+                            if (!flatPresentationFrame) {
+                                triangles.screenOffset.x += p.stereoRectOffsetX;
+                            }
                             break;
                         }
                         case Projection::Type::None:

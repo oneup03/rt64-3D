@@ -13,6 +13,16 @@ namespace RT64 {
 
     // Workload
 
+    bool Workload::anyDepthUsed() const {
+        for (uint32_t i = 0; i < fbPairCount; i++) {
+            if (fbPairs[i].depthRead || fbPairs[i].depthWrite) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void Workload::reset() {
         submissionFrame = 0;
         fbPairCount = 0;

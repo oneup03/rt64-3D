@@ -544,6 +544,35 @@ namespace RT64 {
             // necessarily derive the same baseline.
             const float stereoProjectionScale = projMatrix[0][0];
 
+            // Dinosaur Planet presents whole screens -- the file select, and
+            // full-screen images drawn as a grid of textured tiles -- through the
+            // ordinary camera projection, so they arrive tagged as world geometry
+            // and take world stereo depth at whatever distance those tiles happen
+            // to be modelled at.
+            //
+            // What marks them out is that the FRAME renders no depth at all --
+            // depthRead and depthWrite accumulate zCmp()/zUpd() per pair, and no
+            // pair in the workload sets either. A frame that renders no depth has
+            // no world in it to be at a distance from.
+            //
+            // The question has to be asked of the whole frame rather than of this
+            // one pair. A flush can split a run of Z-disabled draws into a pair of
+            // their own mid-gameplay -- rain does exactly this -- and that pair on
+            // its own looks identical to a menu screen. Flattening it took the
+            // weather out of the world.
+            //
+            // Such a screen gets NO stereo treatment at all: not the world shear,
+            // not the lateral view shift, and not the HUD depth offset either. It
+            // is a flat image, and the screen plane is the only place a flat image
+            // belongs -- parking it at HUD depth would push the entire picture off
+            // the glass just as wrongly as world depth scatters it. The matching
+            // suppression for texture rectangles, which is how the file select
+            // screen draws, is in FramebufferRenderer.
+            //
+            // Frame-level rather than per-projection: if the frame draws no depth
+            // then nothing in it does, whatever projection it arrived under.
+            const bool isFlatPresentation = !workload.anyDepthUsed();
+
             // Publish the world projection's depth terms for the auto-convergence
             // depth sampler. The camera projection only — the skybox shares the
             // stereo shear but not the depth range, and inverting a sampled depth
@@ -551,8 +580,11 @@ namespace RT64 {
             //
             // These elements are untouched by the stereo shear (which only writes
             // m[2][0]), so it does not matter that this runs before it.
+            // A flat presentation is excluded for the same reason the skybox is:
+            // its depth range describes nothing the sampler will read back.
             if ((proj.type == Projection::Type::Perspective) &&
-                isStereoCameraProjectionId(curProjGroup.matrixId)) {
+                isStereoCameraProjectionId(curProjGroup.matrixId) &&
+                !isFlatPresentation) {
                 const interop::RSPViewport &depthViewport = drawData.rspViewports[proj.transformsIndex];
                 stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2],
                     depthViewport.scale[2], depthViewport.translate[2]);
@@ -562,7 +594,8 @@ namespace RT64 {
             // and skybox projections.
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
-                isStereoProjectionId(curProjGroup.matrixId)) {
+                isStereoProjectionId(curProjGroup.matrixId) &&
+                !isFlatPresentation) {
                 applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation);
             }
 
@@ -583,6 +616,7 @@ namespace RT64 {
                 const bool isHudProjection = isStereoHudProjectionId(curProjGroup.matrixId);
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                     isHudProjection &&
+                    !isFlatPresentation &&
                     (p.stereoHudDepth != 50)) {
                     applyStereoHudShift(projMatrix, p.stereoEye, p.stereoHudDepth, p.stereoSeparation, isOrtho);
                 }
@@ -602,7 +636,8 @@ namespace RT64 {
                 // frames the workload emits.
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                     (proj.type == Projection::Type::Perspective) &&
-                    isStereoProjectionId(curProjGroup.matrixId)) {
+                    isStereoProjectionId(curProjGroup.matrixId) &&
+                    !isFlatPresentation) {
                     // Deliberately the CURRENT frame's scale, not one derived from
                     // adjustedPrevProj: the point is that both lerp endpoints carry
                     // an identical stereo transform. Deriving it per-endpoint would
@@ -616,6 +651,7 @@ namespace RT64 {
                     const bool isHudProjection = isStereoHudProjectionId(curProjGroup.matrixId);
                     if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                         isHudProjection &&
+                        !isFlatPresentation &&
                         (p.stereoHudDepth != 50)) {
                         applyStereoHudShift(adjustedPrevProj, p.stereoEye, p.stereoHudDepth, p.stereoSeparation, isOrtho);
                     }
@@ -647,7 +683,8 @@ namespace RT64 {
             // produces the maximum positive parallax (i.e., infinity).
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
-                isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
+                isStereoViewShiftProjectionId(curProjGroup.matrixId) &&
+                !isFlatPresentation) {
                 applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence, stereoProjectionScale);
                 applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, p.stereoConvergence, stereoProjectionScale);
             }

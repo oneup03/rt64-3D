@@ -253,5 +253,14 @@ namespace RT64 {
         void begin(uint64_t submissionFrame);
         bool addFramebufferPair(uint32_t colorAddress, uint8_t colorFmt, uint8_t colorSiz, uint16_t colorWidth, uint32_t depthAddress);
         int currentFramebufferPairIndex() const;
+        // True when ANY framebuffer pair in this frame reads or writes the Z-buffer.
+        //
+        // The per-pair depthRead/depthWrite flags answer a narrower question than
+        // they appear to: a flush can split a run of Z-disabled draws -- weather
+        // particles are the case that caught us -- into a pair of their own, and
+        // that pair reports no depth while the frame it belongs to is ordinary
+        // gameplay. Anything asking "is this frame a world at all" has to ask the
+        // whole workload, not the pair it happens to be looking at.
+        bool anyDepthUsed() const;
     };
 };
