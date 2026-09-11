@@ -284,20 +284,66 @@ namespace RT64 {
             // when a newly-close framing reads worst — the reason cutscenes feel
             // wrong even with the loop running.
             //
-            // But it has to PERSIST to count. Snapping on any single frame past
-            // the threshold reads as twitching, because the near statistic is
+            // Measured as a RATIO, and only in the APPROACH direction. An earlier
+            // form tested |z - ema| / ema, which is bounded above by 1 whenever z
+            // is smaller than ema: for anything getting CLOSER that expression
+            // cannot exceed 1, so a threshold of 1.5 was unreachable in the
+            // approach direction and the snap only ever fired for cuts to a
+            // further view. That is backwards -- a closeup is the case the snap
+            // exists for.
+            //
+            // The correction to that made the test symmetric, which turned out to
+            // be its own bug. An item-get animation holding the character close to
+            // the camera swings the near statistic past a 2.5x ratio in BOTH
+            // directions within a second or two, and a symmetric detector answers
+            // every crossing with a hard snap: in, out, in. That reads as the image
+            // thrashing.
+            //
+            // So the snap is the approach half only. Receding has nothing to
+            // protect against -- convergence sitting nearer than the scene needs
+            // costs only positive parallax, which is bounded by separation and is
+            // comfortable -- so it eases out through the EMA below instead, at the
+            // slow alpha. Dropping the recede half also breaks the alternation on
+            // its own: after an approach snap the EMA sits at the near value, so
+            // the return trip cannot clear the ratio a second time.
+            //
+            // The cost is that a genuine cut from a closeup to a vista now eases
+            // rather than snaps, taking roughly a second to relax. That direction
+            // is the comfortable one to be wrong in, which is why it is the half
+            // that gives way.
+            //
+            // Tested against the RAW sample rather than the median. The median
+            // spans nine frames and needs five of them before it begins to cross
+            // a step at all -- latency the smooth path wants and the cut path
+            // must not pay, since reacting before the viewer has to is the point.
+            //
+            // It still has to PERSIST. Snapping on a single frame past the
+            // threshold reads as twitching, because the near statistic is
             // sensitive enough that an object entering one patch can halve the
-            // reported depth during ordinary play. A real cut stays changed for
-            // as long as the new shot lasts.
-            if (rel > 1.5f) {
+            // reported depth during ordinary play. Two frames rather than three:
+            // the readback already runs several frames behind the GPU, so every
+            // extra frame of confirmation is one more spent at the wrong
+            // convergence.
+            const float approachRatio = (nearestViewZ < zEma) ? (zEma / nearestViewZ) : 1.0f;
+            if (approachRatio > 2.5f) {
                 cutCandidateFrames++;
             }
             else {
                 cutCandidateFrames = 0;
             }
 
-            if (cutCandidateFrames >= 3) {
-                zEma = zMedian;
+            if (cutCandidateFrames >= 2) {
+                // Land on the median of the last three raw samples: the
+                // nine-frame median still holds mostly pre-cut values, so
+                // snapping to it would only go part of the way, while a single
+                // raw sample puts the whole shot at the mercy of one frame.
+                float recent[3];
+                for (uint32_t i = 0; i < 3; i++) {
+                    recent[i] = history[(historyCursor + HistorySize - 1 - i) % HistorySize];
+                }
+
+                std::sort(recent, recent + 3);
+                zEma = recent[1];
                 invConvSmoothed = -1.0f;
                 cutCandidateFrames = 0;
             }
@@ -306,7 +352,7 @@ namespace RT64 {
                 // to be tracked quickly for comfort; something receding should
                 // relax slowly, or convergence chases every small recession and
                 // reads as swimmy.
-                const float alpha = (zMedian < zEma) ? 0.15f : 0.05f;
+                const float alpha = (zMedian < zEma) ? 0.25f : 0.05f;
                 zEma += (zMedian - zEma) * alpha;
             }
         }
@@ -348,7 +394,13 @@ namespace RT64 {
             invConvSmoothed = targetInv;
         }
         else {
-            invConvSmoothed += (targetInv - invConvSmoothed) * 0.06f;
+            // Asymmetric for the same reason the depth EMA is: closing the gap
+            // protects comfort and should be prompt, while easing back out has
+            // nothing to protect against and reads as swimmy if it hurries. A
+            // LARGER target reciprocal is a NEARER convergence, so that is the
+            // direction to hurry.
+            const float invAlpha = (targetInv > invConvSmoothed) ? 0.14f : 0.06f;
+            invConvSmoothed += (targetInv - invConvSmoothed) * invAlpha;
         }
 
         const float applied = std::min(1.0f / invConvSmoothed, manualConv);
