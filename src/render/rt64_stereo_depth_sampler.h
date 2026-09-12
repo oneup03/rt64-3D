@@ -89,9 +89,18 @@ namespace RT64 {
         // per framebuffer PAIR and a frame has several — the world pass plus
         // smaller auxiliary ones whose depth is empty — so it is the caller's job
         // to offer only the main pass.
+        // contentOriginX/contentWidth bound the part of the target the viewer
+        // actually sees, in texels -- see stereoEyeVisibleSpanX. Pass 0 and the
+        // full width when nothing is cropped. The patch grid is laid out inside
+        // that span rather than across the whole target: on an ultrawide the two
+        // are very different, and sampling the discarded margins lets geometry
+        // the player cannot see drive convergence.
+        //
         // aimCenterX/Y are in depth-target texels. Pass a negative x to sample
         // the grid only, which is what happens when the game reports no reticle.
-        bool submit(RenderWorker *worker, RenderTarget *depthTarget, int32_t aimCenterX, int32_t aimCenterY);
+        bool submit(RenderWorker *worker, RenderTarget *depthTarget,
+                    uint32_t contentOriginX, uint32_t contentWidth,
+                    int32_t aimCenterX, int32_t aimCenterY);
 
         struct Sample {
             bool valid = false;

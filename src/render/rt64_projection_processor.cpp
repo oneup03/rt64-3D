@@ -43,18 +43,21 @@ namespace RT64 {
     }
 
     static std::atomic<float> stereoAimViewZ{-1.0f};
-    static std::atomic<int32_t> stereoAimScreenX{-1};
-    static std::atomic<int32_t> stereoAimScreenY{-1};
+    static std::atomic<float> stereoAimScreenX{-1.0f};
+    static std::atomic<float> stereoAimScreenY{-1.0f};
+    static std::atomic<float> stereoAimViewportWidth{0.0f};
 
-    void stereoSetAimScreenPoint(int32_t x, int32_t y) {
+    void stereoSetAimScreenPointPixels(float x, float y, float viewportWidth) {
         stereoAimScreenX.store(x, std::memory_order_relaxed);
         stereoAimScreenY.store(y, std::memory_order_relaxed);
+        stereoAimViewportWidth.store(viewportWidth, std::memory_order_relaxed);
     }
 
-    bool stereoGetAimScreenPoint(int32_t &x, int32_t &y) {
+    bool stereoGetAimScreenPointPixels(float &x, float &y, float &viewportWidth) {
         x = stereoAimScreenX.load(std::memory_order_relaxed);
         y = stereoAimScreenY.load(std::memory_order_relaxed);
-        return (x >= 0) && (y >= 0);
+        viewportWidth = stereoAimViewportWidth.load(std::memory_order_relaxed);
+        return (x >= 0.0f) && (y >= 0.0f) && (viewportWidth > 0.0f);
     }
 
     void stereoStoreAimViewZ(float z) {

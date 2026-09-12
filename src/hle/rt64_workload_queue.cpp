@@ -5,6 +5,7 @@
 #include "rt64_workload_queue.h"
 
 #include "render/rt64_stereo_depth_sampler.h"
+#include "render/rt64_stereo_renderer.h"
 
 #include "common/rt64_thread.h"
 
@@ -162,6 +163,26 @@ namespace RT64 {
             if ((ext.sharedResources->swapChainWidth > 0) && (ext.sharedResources->swapChainHeight > 0)) {
                 const float derivedRatioTarget = float(ext.sharedResources->swapChainWidth) / float(ext.sharedResources->swapChainHeight);
                 workloadConfig.aspectRatioTarget = std::max(derivedRatioTarget, workloadConfig.aspectRatioSource);
+
+                // In stereo each eye is SHOWN at 16:9 however wide the display
+                // is, so rendering an eye wider than that is work thrown away.
+                //
+                // The compose crops a wider-than-16:9 eye to its centred 16:9
+                // slice, which is what makes a full-SbS 32:9 panel show two
+                // correctly proportioned halves instead of two squashed ones.
+                // Deriving the target from the whole 5120x1440 panel therefore had
+                // each eye render 5120x1440 and then throw half of it away: four
+                // times the pixels of a mono 16:9 frame in order to display two.
+                //
+                // Capping produces the same image for half the cost, and leaves
+                // the crop downstream a no-op. The crop stays, as the backstop for
+                // Manual -- an explicit aspect the user picked, which this must
+                // not quietly override.
+                if (ext.sharedResources->userConfig.stereoMode != UserConfiguration::StereoMode::Off) {
+                    constexpr float kMaxStereoEyeAspect = 16.0f / 9.0f;
+                    workloadConfig.aspectRatioTarget = std::max(workloadConfig.aspectRatioSource,
+                        std::min(workloadConfig.aspectRatioTarget, kMaxStereoEyeAspect));
+                }
             }
             else {
                 workloadConfig.aspectRatioTarget = workloadConfig.aspectRatioSource;
@@ -926,9 +947,11 @@ namespace RT64 {
                         const bool autoConvergenceOn = stereoOn && (cfg.stereoAutoConvergence != 0);
                         // The game republishes the reticle position every frame, so
                         // a non-negative x means one is on screen right now.
-                        int32_t aimScreenX = -1;
-                        int32_t aimScreenY = -1;
-                        const bool aimActive = stereoOn && stereoGetAimScreenPoint(aimScreenX, aimScreenY);
+                        float aimPixelX = -1.0f;
+                        float aimPixelY = -1.0f;
+                        float aimViewportWidth = 0.0f;
+                        const bool aimActive = stereoOn &&
+                            stereoGetAimScreenPointPixels(aimPixelX, aimPixelY, aimViewportWidth);
                         // The crosshair needs depth whether or not auto-convergence
                         // is on, so the sampler is no longer gated on that alone.
                         const bool wantDepth = autoConvergenceOn || aimActive;
@@ -938,24 +961,18 @@ namespace RT64 {
                              ((depthTarget->width * 2 >= colorTarget->width) &&
                               (depthTarget->height * 2 >= colorTarget->height)));
                         if (mainPass) {
-                            // Map the reticle from the game's 320x240 screen space
-                            // onto depth-target texels through the frame's own
-                            // scissor rather than the target's dimensions: the
-                            // target is grown and never shrunk and carries a
-                            // horizontal misalignment, so its midpoint is not the
-                            // middle of what was actually drawn.
+                            // The reticle arrives already in render target pixels,
+                            // which is the space the sampler works in, so there is
+                            // nothing left to convert. Nothing here needs the
+                            // resolution scale, the scissor origin or misalignX --
+                            // the renderer applied all of that when it placed the
+                            // rect.
                             int32_t aimTexelX = -1;
                             int32_t aimTexelY = -1;
                             if (aimActive) {
-                                // The reported point is already absolute in 320x240
-                                // screen space, so it only needs the resolution
-                                // scale to become depth texels -- no scissor origin
-                                // term, which would double-count it. misalignX backs
-                                // out the target padding, the same correction the
-                                // rest of the target maths applies.
                                 {
-                                    aimTexelX = int32_t(float(aimScreenX) * fixedResScale[0]) - depthTarget->misalignX;
-                                    aimTexelY = int32_t(float(aimScreenY) * fixedResScale[1]);
+                                    aimTexelX = int32_t(aimPixelX);
+                                    aimTexelY = int32_t(aimPixelY);
 
                                     // Compensate for WHICH EYE this depth target
                                     // belongs to.
@@ -998,14 +1015,34 @@ namespace RT64 {
                                         // target width spans 2.
                                         const float eyeNdc = stereoAimRectOffsetX(stereoEye, prevAimZ,
                                             cfg.stereoSeparation, eyeConvTenths);
-                                        aimTexelX += int32_t(eyeNdc * float(depthTarget->width) * 0.5f);
+                                        // Scaled against the VIEWPORT span the point
+                                        // was measured in, not the target width: the
+                                        // target is padded and grows during play, so
+                                        // the two differ by a moving amount.
+                                        aimTexelX += int32_t(eyeNdc * aimViewportWidth * 0.5f);
                                     }
                                     aimTexelX = std::clamp(aimTexelX, 0, int32_t(depthTarget->width) - 1);
                                     aimTexelY = std::clamp(aimTexelY, 0, int32_t(depthTarget->height) - 1);
                                 }
                             }
 
-                            if (stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget, aimTexelX, aimTexelY)) {
+                            // Hold the sampler to what the compose will actually
+                            // show. A wider-than-16:9 eye is cropped to its centred
+                            // 16:9 slice on the way to the screen, so on a 32:9
+                            // desktop about a quarter of the target at each side is
+                            // rendered and discarded -- and letting the grid reach
+                            // into it had scenery the player cannot see driving
+                            // convergence.
+                            float visibleOriginX = 0.0f;
+                            float visibleWidth = float(depthTarget->width);
+                            if (stereoOn) {
+                                stereoEyeVisibleSpanX(float(depthTarget->width), float(depthTarget->height),
+                                    visibleOriginX, visibleWidth);
+                            }
+
+                            if (stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget,
+                                    uint32_t(visibleOriginX), uint32_t(visibleWidth),
+                                    aimTexelX, aimTexelY)) {
                                 const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
 
                                 // Invert the sampled depth with the projection the

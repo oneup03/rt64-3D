@@ -1794,18 +1794,26 @@ namespace RT64 {
                                 // invisible against depth that changes continuously.
                                 triangles.screenOffset.x += stereoSnapNdcToPixel(p.stereoCrosshairOffsetX, halfViewportSize.x);
 
-                                // Report where it landed, in the 320x240 space the depth
-                                // sampler works in, so the NEXT frame samples depth under
-                                // the reticle. A frame behind is fine -- the aim depth is
-                                // EMA-smoothed over several frames anyway -- and it removes
-                                // any dependence on the game reporting its position.
-                                const int32_t rawW = fbPair.scissorRect.lrx - fbPair.scissorRect.ulx;
-                                const int32_t rawH = fbPair.scissorRect.lry - fbPair.scissorRect.uly;
-                                if ((rawW > 0) && (rawH > 0)) {
-                                    const int32_t cx = ((call.callDesc.rect.ulx + call.callDesc.rect.lrx) / 2) - fbPair.scissorRect.ulx;
-                                    const int32_t cy = ((call.callDesc.rect.uly + call.callDesc.rect.lry) / 2) - fbPair.scissorRect.uly;
-                                    stereoSetAimScreenPoint((cx * 320) / rawW, (cy * 240) / rawH);
-                                }
+                                // Report where it landed so the NEXT frame samples
+                                // depth under the reticle. A frame behind is fine --
+                                // the aim depth is EMA-smoothed over several frames
+                                // anyway -- and it removes any dependence on the game
+                                // reporting its own position.
+                                //
+                                // viewportRect is the rect's placement in target
+                                // pixels, already through the same widescreen
+                                // centering every other rect goes through, so it
+                                // needs no correction and stays right at any aspect
+                                // ratio. Taken from viewportRect rather than from
+                                // screenOffset because the stereo shift is added to
+                                // the latter just above -- reporting that would have
+                                // the reticle chase the offset applied to it, and the
+                                // sampled column would drift with the very aim depth
+                                // it is supposed to be measuring.
+                                stereoSetAimScreenPointPixels(
+                                    viewportRect.x + (viewportRect.width * 0.5f),
+                                    viewportRect.y + (viewportRect.height * 0.5f),
+                                    framebuffer.viewport.width);
                             }
                             else
                             if (!spansScissorWidth && !flatPresentationFrame) {

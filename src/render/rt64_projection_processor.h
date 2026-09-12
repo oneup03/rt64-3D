@@ -34,8 +34,24 @@ namespace RT64 {
     // though the game publishes it: the queues read a COPY of that struct which
     // is only refreshed when a setting changes, so a value republished every
     // frame would never arrive. Same reasoning as the auto-convergence values.
-    void stereoSetAimScreenPoint(int32_t x, int32_t y);
-    bool stereoGetAimScreenPoint(int32_t &x, int32_t &y);
+    // Reticle position in RENDER TARGET PIXELS, published by the draw that
+    // matched it and consumed a frame later by the depth sampler. A negative x
+    // means none has been reported.
+    //
+    // Target pixels: not the game's 320x240 screen space, and not NDC. 320-space
+    // has to be rebuilt through the widescreen centering the rect path applies,
+    // which is what put the sampled column in the wrong place on an ultrawide.
+    // NDC looks like the fix and is worse -- it is relative to the framebuffer
+    // VIEWPORT (fbWidth * resolutionScale), while the sampler works in depth
+    // TARGET texels, and targets are grown and never shrunk, so the two spans
+    // differ by an amount that CHANGES DURING PLAY. The renderer already holds
+    // the rect's placement in target pixels, so publishing that leaves nothing
+    // to reconstruct.
+    //
+    // viewportWidth travels alongside so a consumer can convert an NDC-space
+    // correction into the same pixel space without guessing at the span.
+    void stereoSetAimScreenPointPixels(float x, float y, float viewportWidth);
+    bool stereoGetAimScreenPointPixels(float &x, float &y, float &viewportWidth);
 
     void stereoStoreAimViewZ(float z);
     float stereoLoadAimViewZ();
