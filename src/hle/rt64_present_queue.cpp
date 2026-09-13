@@ -629,6 +629,27 @@ namespace RT64 {
                     }
                 }
 
+#           ifdef LEIASR_SUPPORTED
+                // The switchable lenticular lens is GLOBAL display state. The
+                // enable/disable calls express a PREFERENCE, and the SR service
+                // ORs the preferences of every connected application - so the
+                // lens stays on for as long as any app still wants it on,
+                // including this one after it has stopped weaving. Handing it
+                // back is a correctness requirement rather than politeness:
+                // without this the panel stays lensed over every other 3D output
+                // mode we offer, over other applications, and over the desktop.
+                //
+                // Driven by whether this frame actually WOVE, not by which mode
+                // is selected. A frame that asked for LeiaSR and fell back to
+                // plain Side-by-Side - the weaver failed to come up, the runtime
+                // is absent, a mid-session weave threw - is putting a
+                // side-by-side image on screen that the lens would only garble,
+                // so it has to release too. One call per present is the whole
+                // policy, and it costs a bool compare on the frames where
+                // nothing changed.
+                leiaSRWeaver.setLensHint(composedThroughWeaver);
+#           endif
+
                 RenderHookDraw *drawHook = GetRenderHookDraw();
                 if (drawHook != nullptr) {
                     const auto stereoModeHook = ext.sharedResources->userConfig.stereoMode;

@@ -97,12 +97,12 @@ namespace RT64 {
         developerMode = false;
         stereoMode = StereoMode::Off;
         stereoSeparation = 10;
-        stereoConvergence = 200;   // tenths -> 20.0
+        stereoConvergence = 2000;   // hundredths -> 20.0
         stereoHudDepth = 35;
         stereoGhostContrast = 100;
         stereoGhostBlackFloor = 0;
         stereoAutoConvergence = 0;
-        stereoConvergenceManual = 200;
+        stereoConvergenceManual = 2000;
         stereoComfortTarget = 5;
         stereoSceneLowConvergence = 0;
         stereoSceneFirstPerson = 0;
@@ -122,12 +122,12 @@ namespace RT64 {
         clampEnum<HardwareResolve>(hardwareResolve);
         clampEnum<StereoMode>(stereoMode);
         stereoSeparation = std::clamp<uint32_t>(stereoSeparation, 0, 50);
-        stereoConvergence = std::clamp<uint32_t>(stereoConvergence, 1, 500);
+        stereoConvergence = std::clamp<uint32_t>(stereoConvergence, 10, 2000);
         stereoHudDepth = std::clamp<uint32_t>(stereoHudDepth, 0, 100);
         stereoGhostContrast = std::clamp<uint32_t>(stereoGhostContrast, 0, 100);
         stereoGhostBlackFloor = std::clamp<uint32_t>(stereoGhostBlackFloor, 0, 100);
         stereoAutoConvergence = (stereoAutoConvergence != 0) ? 1 : 0;
-        stereoConvergenceManual = std::clamp<uint32_t>(stereoConvergenceManual, 1, 500);
+        stereoConvergenceManual = std::clamp<uint32_t>(stereoConvergenceManual, 10, 2000);
         stereoComfortTarget = std::clamp<int32_t>(stereoComfortTarget, -50, 60);
         stereoSceneLowConvergence = (stereoSceneLowConvergence != 0) ? 1 : 0;
         stereoSceneFirstPerson = (stereoSceneFirstPerson != 0) ? 1 : 0;

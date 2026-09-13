@@ -17,7 +17,10 @@ namespace RT64 {
         StereoDepthSampler::FootprintRowTexels * StereoDepthSampler::PatchSize * DepthTexelSize;
     static constexpr uint32_t PatchBufferSize = PatchStride * StereoDepthSampler::TotalPatchCount;
 
-    bool StereoDepthSampler::submit(RenderWorker *worker, RenderTarget *depthTarget, int32_t aimCenterX, int32_t aimCenterY) {
+    bool StereoDepthSampler::submit(RenderWorker *worker, RenderTarget *depthTarget,
+                                    uint32_t contentOriginX, uint32_t contentWidth,
+                                    int32_t aimCenterX, int32_t aimCenterY,
+                                    int32_t aimOffsetMin, int32_t aimOffsetMax) {
         if ((worker == nullptr) || (depthTarget == nullptr)) {
             return false;
         }
@@ -72,10 +75,23 @@ namespace RT64 {
         // is near enough to win the near statistic but marginal enough to drop
         // in and out of it, so the loop flipped between two stable solves every
         // few frames.
+        //
+        // The horizontal margins are measured against the VISIBLE span, not the
+        // whole target. A wider-than-16:9 eye is cropped to its centred 16:9
+        // slice before the viewer sees it, so on a 32:9 desktop roughly a
+        // quarter of the target at each side is rendered and thrown away.
+        // Spreading the grid across all of it lets scenery well outside the
+        // frame win the near statistic and pull convergence in for no visible
+        // reason.
         const RenderTextureCopyLocation srcLocation = RenderTextureCopyLocation::Subresource(texture, 0);
-        const uint32_t usableW = (targetWidth * (100 - RoiMarginLeftPercent - RoiMarginRightPercent)) / 100;
+        // The available width is checked rather than assumed: an origin close to
+        // the right edge would otherwise produce a zero or inverted span.
+        const uint32_t spanX = std::min(contentOriginX, targetWidth - PatchSize);
+        const uint32_t spanAvail = targetWidth - spanX;
+        const uint32_t spanW = std::min(std::max(contentWidth, PatchSize), spanAvail);
+        const uint32_t usableW = (spanW * (100 - RoiMarginLeftPercent - RoiMarginRightPercent)) / 100;
         const uint32_t usableH = (targetHeight * (100 - RoiMarginTopPercent - RoiMarginBottomPercent)) / 100;
-        const uint32_t originX = (targetWidth * RoiMarginLeftPercent) / 100;
+        const uint32_t originX = spanX + ((spanW * RoiMarginLeftPercent) / 100);
         const uint32_t originY = (targetHeight * RoiMarginTopPercent) / 100;
 
         for (uint32_t row = 0; row < PatchRows; row++) {
@@ -101,31 +117,30 @@ namespace RT64 {
             }
         }
 
-        // Aim window: AimPatchCols patches spread across a span PROPORTIONAL to
-        // the frame, not butted together at a fixed pixel width.
+        // Aim strip: AimPatchCount tight patches spread across the range of
+        // buffer positions the aim point could resolve to.
         //
-        // Packed side by side they covered 160 texels, which is about 4% of a 4K
-        // frame's width while the reticle spans nearer 30% - so however well it
-        // was centred it only ever read a sliver near the middle, and the halves
-        // of the reticle contributed nothing. The span now scales with the
-        // target so the same fraction of the reticle is covered at any render
-        // resolution.
-        // A sixteenth of the frame. Measured against DK64's reticle, which is
-        // roughly 865 texels wide at 4K, an eighth reached most of the way across
-        // it; this covers the middle third, which is the part the player is
-        // actually pointing with.
-        const int32_t aimSpan = std::max<int32_t>(int32_t(AimPatchCols * PatchSize), int32_t(targetWidth) / 16);
-        for (uint32_t i = 0; i < AimPatchCols; i++) {
-            const uint32_t index = PatchCount + i;
-            const int32_t step = (AimPatchCols > 1) ? (aimSpan / int32_t(AimPatchCols - 1)) : 0;
-            int32_t left = (aimCenterX - (aimSpan / 2)) + (int32_t(i) * step) - int32_t(PatchSize / 2);
+        // Each patch stays 32 texels wide - narrow is the point, since every
+        // texel of width is a texel of something the player is not pointing at.
+        // The STRIP is wide, but it is never pooled: the caller judges each
+        // patch separately and keeps exactly one.
+        //
+        // The offsets are recorded on the slot because they are read back
+        // several frames later, by which time the separation slider - which
+        // sets the span - may have moved.
+        const int32_t aimSpan = std::max(aimOffsetMax - aimOffsetMin, 1);
+        for (uint32_t i = 0; i < AimPatchCount; i++) {
+            const int32_t offset = aimOffsetMin + int32_t((int64_t(aimSpan) * i) / int64_t(AimPatchCount - 1));
+            slot.aimOffsets[i] = offset;
+
+            int32_t left = (aimCenterX + offset) - int32_t(PatchSize / 2);
             int32_t top = aimCenterY - int32_t(PatchSize / 2);
             left = std::max(0, std::min(left, int32_t(targetWidth - PatchSize)));
             top = std::max(0, std::min(top, int32_t(targetHeight - PatchSize)));
 
             const RenderTextureCopyLocation dstLocation = RenderTextureCopyLocation::PlacedFootprint(
                 slot.buffer.get(), RenderFormat::D32_FLOAT, FootprintRowTexels, PatchSize, 1,
-                FootprintRowTexels, uint64_t(index) * PatchStride);
+                FootprintRowTexels, uint64_t(AimPatchIndex + i) * PatchStride);
             const RenderBox srcBox(left, top, left + int32_t(PatchSize), top + int32_t(PatchSize));
             worker->commandList->copyTextureRegion(dstLocation, srcLocation, 0, 0, 0, &srcBox);
         }
@@ -174,24 +189,18 @@ namespace RT64 {
         // stray texels from particles, but sensitive to anything filling a
         // meaningful part of one small patch), then a low order statistic ACROSS
         // the patch results. A small object only has to dominate one patch.
-        // The aim depth is taken from a horizontal BAND of patches across the
-        // middle row, not the single centre patch. One 32x32 window is 0.8% of a
-        // 4K frame's width, narrow enough that the value swings depending on
-        // exactly what sliver of geometry sits under it - which showed up as the
-        // reticle sitting at a depth that did not match the thing it was over,
-        // reading as one eye aiming at the target and the other not. Three
-        // patches of the middle row span about a fifth of the width and give a
-        // far more representative answer, at no extra copy cost.
-        const uint32_t centreIndexLo = PatchCount;
-        const uint32_t centreIndexHi = PatchCount + AimPatchCols - 1;
+        // The aim depth comes from the single aim patch, and takes a MEDIAN of
+        // it. The "reticle sits at a depth that did not match the thing it was
+        // over, reading as one eye aiming at the target and the other not"
+        // symptom that a wider band was once introduced to cure was the per-eye
+        // sampling offset, not a window too narrow to be representative; it is
+        // fixed at the source now.
         std::vector<float> patchSamples;
         std::vector<float> patchNears;
-        std::vector<float> centreSamples;
         patchSamples.reserve(PatchSize * PatchSize);
         patchNears.reserve(PatchCount);
-        centreSamples.reserve(AimPatchCols * PatchSize * PatchSize);
 
-        for (uint32_t patch = 0; patch < TotalPatchCount; patch++) {
+        for (uint32_t patch = 0; patch < PatchCount; patch++) {
             const float *patchData = data + ((size_t(patch) * PatchStride) / DepthTexelSize);
             patchSamples.clear();
             for (uint32_t y = 0; y < PatchSize; y++) {
@@ -207,16 +216,6 @@ namespace RT64 {
                 }
             }
 
-            if ((patch >= centreIndexLo) && (patch <= centreIndexHi)) {
-                centreSamples.insert(centreSamples.end(), patchSamples.begin(), patchSamples.end());
-            }
-
-            // Aim patches are for the crosshair only; letting them into the
-            // wide near statistic would double-count the centre of the frame.
-            if (patch >= PatchCount) {
-                continue;
-            }
-
             // Require enough coverage that the percentile means something.
             if (patchSamples.size() < 32) {
                 continue;
@@ -227,35 +226,46 @@ namespace RT64 {
             patchNears.push_back(patchSamples[patchNearIndex]);
         }
 
+        // Aim strip: a MEDIAN per patch. Same validity rule as the grid patches -
+        // enough covered texels for the statistic to mean something - but the
+        // middle of the distribution rather than its near tail, because what the
+        // crosshair should sit on is whatever FILLS a window.
+        //
+        // A near-percentile here (this was a ~1.5% one, effectively a minimum)
+        // reports the nearest surface anywhere in a window, so a sliver of
+        // something closer clipping one edge takes the whole answer.
+        //
+        // Read BEFORE the grid's early-out below, so the crosshair does not
+        // depend on the convergence loop having a usable frame. The patches are
+        // deliberately kept separate; pooling them would be the wide-window bias
+        // all over again.
+        for (uint32_t i = 0; i < AimPatchCount; i++) {
+            const float *aimData = data + ((size_t(AimPatchIndex + i) * PatchStride) / DepthTexelSize);
+            patchSamples.clear();
+            for (uint32_t y = 0; y < PatchSize; y++) {
+                const float *row = aimData + (size_t(y) * FootprintRowTexels);
+                for (uint32_t x = 0; x < PatchSize; x++) {
+                    const float d = row[x];
+                    if ((d > 0.0f) && (d < 1.0f)) {
+                        patchSamples.push_back(d);
+                    }
+                }
+            }
+
+            result.aim[i].offsetTexels = slot.aimOffsets[i];
+            result.aim[i].sampleCount = uint32_t(patchSamples.size());
+            if (patchSamples.size() >= 32) {
+                const size_t midIndex = patchSamples.size() / 2;
+                std::nth_element(patchSamples.begin(), patchSamples.begin() + midIndex, patchSamples.end());
+                result.aim[i].deviceDepth = patchSamples[midIndex];
+                result.aim[i].valid = true;
+            }
+        }
+
         slot.buffer->unmap();
 
         if (patchNears.empty()) {
             return result;
-        }
-
-        if (!centreSamples.empty()) {
-            // Very close to the minimum, but not the minimum.
-            //
-            // The aim depth wants the NEAREST surface in the window, not a
-            // representative one. A 10th percentile only finds the target if the
-            // target fills more than a tenth of the window, so aiming at
-            // anything small returned the background behind it and the reticle
-            // sat too deep - which is exactly how it looked on close geometry.
-            //
-            // Literal min is the other extreme, and one bad texel is enough to
-            // ruin it - an alpha edge, a particle, a sliver of geometry clipping
-            // the window. dynamic3d 4.1 warns against min for that reason, but
-            // that warning is about the WIDE region of interest, where a single
-            // spike anywhere on screen would slam convergence. This window is
-            // small and spatially coherent, so the same argument does not carry:
-            // a real surface under the reticle covers hundreds of texels, while
-            // a speck covers a handful.
-            //
-            // A ~1.5% percentile is min-like for anything real and still needs
-            // dozens of bad texels in a row to be fooled.
-            const size_t centreNear = centreSamples.size() / 64;
-            std::nth_element(centreSamples.begin(), centreSamples.begin() + centreNear, centreSamples.end());
-            result.medianDeviceDepth = centreSamples[centreNear];
         }
 
         // Smaller device depth is closer under a standard depth range, so the
@@ -277,16 +287,22 @@ namespace RT64 {
         invConvSmoothed = -1.0f;
     }
 
-    uint32_t StereoAutoConvergence::update(float nearestViewZ, uint32_t manualConvergenceTenths, uint32_t separationSlider,
+    // Mirrors ConvergenceWorldPerUnit in the projection processor. The solve
+    // below is expressed in the clip-space parameterization and silently retunes
+    // itself if the two drift apart, so they are commented on both sides rather
+    // than only here.
+    static constexpr float ConvergenceWorldPerUnit = 0.2f;
+
+    uint32_t StereoAutoConvergence::update(float nearestViewZ, uint32_t manualConvergenceHundredths, uint32_t separationSlider,
                                            int32_t comfortTarget, bool sceneWantsLowConvergence) {
         // Same unit conversions the projection processor uses.
         const float separation = float(separationSlider) * (0.10f / 50.0f);
-        const float manualConv = float(manualConvergenceTenths) * 2.0f;
+        const float manualConv = float(manualConvergenceHundredths) * ConvergenceWorldPerUnit;
 
         // Guard on separation, not on any projection term: at zero separation
         // there is no disparity to bound and the solve would divide by zero.
         if ((nearestViewZ <= 0.0f) || (separation <= 0.0f) || (manualConv <= 0.0f)) {
-            return manualConvergenceTenths;
+            return manualConvergenceHundredths;
         }
 
         // dynamic3d 4.2 - a temporal median before the EMA, catching
@@ -315,21 +331,69 @@ namespace RT64 {
             // when a newly-close framing reads worst - the reason cutscenes felt
             // wrong even with the loop running.
             //
-            // But it has to PERSIST to count. The first version snapped on any
-            // single frame past the threshold, and once the near statistic became
-            // sensitive enough to catch small objects that happened constantly in
-            // ordinary play - an object entering one patch halves the reported
-            // depth - so it snapped over and over and read as twitching. A real
-            // cut stays changed for as long as the new shot lasts.
-            if (rel > 1.5f) {
+            // Measured as a RATIO, and only in the APPROACH direction.
+            //
+            // The previous form tested rel, i.e. |z - ema| / ema, against 1.5.
+            // That expression is bounded above by 1 whenever z is smaller than
+            // ema - it is 1 - z/ema there, which cannot reach 1 however close
+            // the object gets - so a threshold of 1.5 was UNREACHABLE in the
+            // approach direction and the snap only ever fired for cuts to a
+            // further view. Backwards: a closeup is the case the snap exists
+            // for. dynamic3d 4.2 calls this out as a trap that survives review
+            // because the asymmetry is invisible until the algebra is written
+            // out.
+            //
+            // Making the ratio symmetric is the obvious correction and is its
+            // own bug (dynamic3d 4.5). Anything held close to the camera and
+            // moving - a pickup animation, an NPC leaning in - swings the near
+            // statistic past a 2.5x ratio in BOTH directions within a second or
+            // two, and a symmetric detector answers every crossing with a hard
+            // snap and a smoother reset: in, out, in. That reads as the image
+            // thrashing, which alarms a viewer more than the sluggishness it
+            // replaced.
+            //
+            // So the snap is the approach half only. Recession has nothing to
+            // protect against - convergence sitting nearer than the scene needs
+            // costs only positive parallax, which is bounded by separation - so
+            // it eases out through the EMA below at the slow alpha. Dropping
+            // the recede half also breaks the alternation on its own: after an
+            // approach snap the EMA sits at the near value, so the return trip
+            // cannot clear the ratio a second time. The price is that a genuine
+            // cut from a closeup to a vista eases over about a second instead of
+            // snapping, which is the comfortable direction to be wrong in.
+            //
+            // Tested against the RAW sample rather than the median: the median
+            // spans HistorySize frames and needs half of them before it begins
+            // to cross a step at all, and that is latency the smooth path wants
+            // and the cut path must not pay.
+            //
+            // It still has to PERSIST. Snapping on a single frame past the
+            // threshold reads as twitching, because the near statistic is
+            // sensitive enough that an object entering one patch can halve the
+            // reported depth during ordinary play. Two frames rather than
+            // three: the readback already runs several frames behind the GPU,
+            // so every extra confirmation frame is one more spent at the wrong
+            // convergence.
+            const float approachRatio = (nearestViewZ < zEma) ? (zEma / nearestViewZ) : 1.0f;
+            if (approachRatio > 2.5f) {
                 cutCandidateFrames++;
             }
             else {
                 cutCandidateFrames = 0;
             }
 
-            if (cutCandidateFrames >= 3) {
-                zEma = zMedian;
+            if (cutCandidateFrames >= 2) {
+                // Land on the median of the last three RAW samples. The long
+                // median still holds mostly pre-cut values, so snapping to it
+                // would only go part of the way; a single raw sample puts the
+                // whole shot at the mercy of one frame.
+                float recent[3];
+                for (uint32_t i = 0; i < 3; i++) {
+                    recent[i] = history[(historyCursor + HistorySize - 1 - i) % HistorySize];
+                }
+
+                std::sort(recent, recent + 3);
+                zEma = recent[1];
                 invConvSmoothed = -1.0f;
                 cutCandidateFrames = 0;
             }
@@ -338,7 +402,7 @@ namespace RT64 {
                 // to be tracked quickly for comfort; something receding should
                 // relax slowly, or convergence chases every small recession and
                 // reads as swimmy.
-                const float alpha = (zMedian < zEma) ? 0.15f : 0.05f;
+                const float alpha = (zMedian < zEma) ? 0.25f : 0.05f;
                 zEma += (zMedian - zEma) * alpha;
             }
         }
@@ -381,15 +445,30 @@ namespace RT64 {
             invConvSmoothed = targetInv;
         }
         else {
-            invConvSmoothed += (targetInv - invConvSmoothed) * 0.06f;
+            // Asymmetric for the same reason the depth EMA is, and not redundant
+            // with it: the EMA governs how fast the loop believes the scene
+            // changed, this governs how fast the picture follows that belief.
+            // Closing the gap protects comfort and should be prompt, while
+            // easing back out has nothing to protect against and reads as the
+            // image drifting if it hurries. A LARGER target reciprocal is a
+            // NEARER convergence, so that is the direction to hurry.
+            const float invAlpha = (targetInv > invConvSmoothed) ? 0.14f : 0.06f;
+            invConvSmoothed += (targetInv - invConvSmoothed) * invAlpha;
         }
 
         const float applied = std::min(1.0f / invConvSmoothed, manualConv);
-        const uint32_t appliedTenths = uint32_t(std::lround(applied / 2.0f));
-        return (appliedTenths < 1u) ? 1u : appliedTenths;
+        // Rounded back into bridge units. This is the only place the loop's
+        // continuous solve gets quantised, which is why the unit is a hundredth
+        // of a slider step rather than a tenth - see ConvergenceWorldPerUnit.
+        const uint32_t appliedUnits = uint32_t(std::lround(applied / ConvergenceWorldPerUnit));
+        // Never 0: that value is the sentinel for "the loop has nothing to say
+        // and the manual setting stands". The solve's own floor (NearClamp) is
+        // far above this, so this is a degenerate-input backstop only.
+        return (appliedUnits < 1u) ? 1u : appliedUnits;
     }
 
-    float stereoDeviceDepthToViewZ(float deviceDepth, float projM22, float projM32) {
+    float stereoDeviceDepthToViewZ(float deviceDepth, float projM22, float projM32,
+                                   float vpScaleZ, float vpTranslateZ) {
         if ((deviceDepth <= 0.0f) || (deviceDepth >= 1.0f)) {
             return -1.0f;
         }
@@ -398,16 +477,31 @@ namespace RT64 {
         // and clip.w = -view.z, so ndc.z = -(m[2][2] + m[3][2] / view.z) and
         //     view.z = m[3][2] / (-ndc.z - m[2][2]).
         //
-        // The device depth is NOT ndc.z. The buffer holds [0,1] while the N64's
-        // GL-style projection produces ndc.z over [-1,1], so it has to be mapped
-        // back before the inversion. Feeding the device value in directly - which
-        // this did - overestimates distance by 1.75x to 1.9x over DK64's depth
-        // range, which put the crosshair well behind whatever it was aimed at and
-        // made the convergence loop think everything was further away than it is.
-        // This is exactly the convention assumption dynamic3d 4.1 warns about;
-        // it was caught by checking the inversion against known samples rather
-        // than by reading the code.
-        const float ndcZ = (2.0f * deviceDepth) - 1.0f;
+        // The device depth is NOT ndc.z, and undoing that takes TWO layers.
+        //
+        // First the NDC convention: the buffer holds [0,1] while the N64's
+        // GL-style projection produces ndc.z over [-1,1]. Feeding the device
+        // value in directly - which this did - overestimates distance by 1.75x
+        // to 1.9x over DK64's depth range, which put the crosshair well behind
+        // whatever it was aimed at and made the convergence loop think
+        // everything was further away than it is.
+        //
+        // Second the VIEWPORT's own depth scale and translate, which dynamic3d
+        // 4.1 warns is rarely the clean half the first layer makes it look
+        // like. On the N64 it is a G_MAXZ fixed-point value - 32704/65536 =
+        // 0.499023 on a measured title - and that 0.2% is not ignorable,
+        // because it perturbs the term that survives after almost all of m22
+        // cancels. Assuming exactly 0.5 leaves near objects correct and reads
+        // everything beyond progressively CLOSER than it is: roughly -0.3% at
+        // 10 units, -4.5% at 100, -20% at 1000. The error signature is a
+        // crosshair that tracks fine up close but sits short of mid-range
+        // targets, and auto-convergence quietly over-pulling.
+        //
+        // Fall back to the nominal remap only when no viewport was published,
+        // which is the "this frame had none" case rather than a measured value.
+        const float ndcZ = (vpScaleZ > 1e-6f)
+            ? ((deviceDepth - vpTranslateZ) / vpScaleZ)
+            : ((2.0f * deviceDepth) - 1.0f);
         const float denom = -ndcZ - projM22;
         if (std::fabs(denom) < 1e-6f) {
             return -1.0f;

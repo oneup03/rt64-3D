@@ -115,10 +115,20 @@ namespace RT64 {
         bool idleWorkActive;
         bool developerMode;
         StereoMode stereoMode;
-        // Slider values set from the host application; converted to world-space
-        // units by the renderer. Separation is 0..50 (0..0.10 of screen width).
-        // Convergence is in TENTHS of its slider, 1..500 (= 0.1..50), so the
-        // slider can step below 1 without this bridge going floating point.
+        // Slider values set from the host application; converted to clip-space
+        // separation / world-space convergence by the renderer. Separation is
+        // 0..50 (0..0.10 of screen width).
+        //
+        // Convergence is in HUNDREDTHS of its slider, 10..2000 (= 0.1..20), so
+        // the slider can step below 1 without this bridge going floating point.
+        //
+        // Hundredths rather than tenths because the depth-driven loop's solve is
+        // continuous and gets quantised coming back through here. A tenth is 2
+        // world units; at the close convergences auto-convergence pulls to, that
+        // is a step of several percent of the applied value, and the resulting
+        // disparity jump reads as the image stepping rather than easing. A
+        // hundredth is 0.2 world units, under a pixel of disparity at any
+        // separation. The slider itself still moves in tenths.
         uint32_t stereoSeparation;
         uint32_t stereoConvergence;
         // HUD/textbox depth slider. 50 = screen plane (mono). Below 50 the HUD

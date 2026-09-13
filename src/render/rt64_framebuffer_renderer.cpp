@@ -20,6 +20,7 @@
 #include <tuple>
 
 #include "rt64_descriptor_sets.h"
+#include "rt64_projection_processor.h"
 #include "rt64_render_worker.h"
 
 // TODO: Move to shared.
@@ -68,7 +69,8 @@ namespace RT64 {
     // which are excluded explicitly.
     static bool stereoIsCrosshairCandidate(const DrawData &drawData, uint32_t minWorldMatrix,
                                            uint32_t maxWorldMatrix, uint32_t triangleCount,
-                                           uint32_t faceIndicesStart, const FixedRect &scissor) {
+                                           uint32_t faceIndicesStart, const FixedRect &scissor,
+                                           float *outMinX, float *outMaxX, float *outMinY, float *outMaxY) {
         // One quad.
         if (triangleCount != 2) {
             return false;
@@ -135,7 +137,23 @@ namespace RT64 {
         const float by = (minY + maxY) * 0.5f;
         // Within a fifth of the viewport of centre in each axis, which covers the
         // whole 3x3 grid without reaching the text bands.
-        return (std::fabs(bx - cx) < (sw * 0.2f)) && (std::fabs(by - cy) < (sh * 0.2f));
+        //
+        // Deliberately loose, which is why the aim point must be taken from the
+        // matched quad's own bounds rather than from the viewport centre: a
+        // reticle a hundred texels off centre passes this test and would bias
+        // every depth sample by that much.
+        if (!((std::fabs(bx - cx) < (sw * 0.2f)) && (std::fabs(by - cy) < (sh * 0.2f)))) {
+            return false;
+        }
+
+        if (outMinX != nullptr) {
+            *outMinX = minX;
+            *outMaxX = maxX;
+            *outMinY = minY;
+            *outMaxY = maxY;
+        }
+
+        return true;
     }
 
     // Helper functions.
@@ -1724,12 +1742,19 @@ namespace RT64 {
                                 // Place the first-person crosshair at the depth
                                 // being aimed at rather than at HUD depth.
                                 //
-                                // Gated on stereoCrosshairValid, which is false
-                                // whenever there is no aim depth. That is what
-                                // keeps the title screen's centred logo out of
-                                // this: it matches the geometry closely, but that
-                                // screen renders no world depth, so there is
-                                // nothing for it to match against.
+                                // Gated on stereoCrosshairValid, which requires
+                                // the game to be reporting a live first-person
+                                // camera. That is what keeps the title screen's
+                                // centred logo out of this: it matches the
+                                // geometry closely, and a depth gate would not
+                                // separate them either, because that screen runs
+                                // a 3D demo behind it and so has a valid depth
+                                // like any other. Game state does.
+                                //
+                                // Note the offset itself is defined for a missing
+                                // depth sample - it resolves to infinity, not to
+                                // the screen plane - so "no aim depth" is not a
+                                // gate and must not be mistaken for one.
                                 //
                                 // Sky projections are excluded outright. Creepy
                                 // Castle's moon is a two-triangle orthographic
@@ -1750,11 +1775,20 @@ namespace RT64 {
                                         : uint32_t(0);
                                 const bool skyProjection = (projMatrixId == 0x00000004u);
 
+                                float reticleMinX = 0.0f, reticleMaxX = 0.0f;
+                                float reticleMinY = 0.0f, reticleMaxY = 0.0f;
                                 if (p.stereoCrosshairValid && !skyProjection &&
                                     stereoIsCrosshairCandidate(drawData, call.callDesc.minWorldMatrix,
                                         call.callDesc.maxWorldMatrix, call.callDesc.triangleCount,
-                                        call.meshDesc.faceIndicesStart, fbPair.scissorRect)) {
+                                        call.meshDesc.faceIndicesStart, fbPair.scissorRect,
+                                        &reticleMinX, &reticleMaxX, &reticleMinY, &reticleMaxY)) {
                                     triangles.screenOffset.x += p.stereoCrosshairOffsetX;
+                                    // Report where it actually is, so the depth
+                                    // sampler stops assuming the viewport centre.
+                                    // posScreen is the game's own pre-stereo
+                                    // position, which is the undisplaced aim point
+                                    // the sampler wants.
+                                    stereoAccumulateReticleBounds(reticleMinX, reticleMaxX, reticleMinY, reticleMaxY);
                                 }
                             }
                             break;

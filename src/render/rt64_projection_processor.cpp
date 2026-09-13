@@ -20,25 +20,96 @@
 namespace RT64 {
     static std::atomic<uint32_t> worldDepthM22Bits{0};
     static std::atomic<uint32_t> worldDepthM32Bits{0};
+    static std::atomic<uint32_t> worldDepthVpScaleZBits{0};
+    static std::atomic<uint32_t> worldDepthVpTranslateZBits{0};
     static std::atomic<bool> worldDepthTermsValid{false};
 
-    void stereoPublishWorldDepthTerms(float m22, float m32) {
-        uint32_t bits22, bits32;
-        std::memcpy(&bits22, &m22, sizeof(bits22));
-        std::memcpy(&bits32, &m32, sizeof(bits32));
-        worldDepthM22Bits.store(bits22, std::memory_order_relaxed);
-        worldDepthM32Bits.store(bits32, std::memory_order_relaxed);
+    static uint32_t floatToBits(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
+    static float bitsToFloat(uint32_t bits) {
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    void stereoPublishWorldDepthTerms(float m22, float m32, float vpScaleZ, float vpTranslateZ) {
+        worldDepthM22Bits.store(floatToBits(m22), std::memory_order_relaxed);
+        worldDepthM32Bits.store(floatToBits(m32), std::memory_order_relaxed);
+        worldDepthVpScaleZBits.store(floatToBits(vpScaleZ), std::memory_order_relaxed);
+        worldDepthVpTranslateZBits.store(floatToBits(vpTranslateZ), std::memory_order_relaxed);
         worldDepthTermsValid.store(true, std::memory_order_relaxed);
     }
 
-    bool stereoGetWorldDepthTerms(float &m22, float &m32) {
+    bool stereoGetWorldDepthTerms(float &m22, float &m32, float &vpScaleZ, float &vpTranslateZ) {
         if (!worldDepthTermsValid.load(std::memory_order_relaxed)) {
             return false;
         }
-        const uint32_t bits22 = worldDepthM22Bits.load(std::memory_order_relaxed);
-        const uint32_t bits32 = worldDepthM32Bits.load(std::memory_order_relaxed);
-        std::memcpy(&m22, &bits22, sizeof(m22));
-        std::memcpy(&m32, &bits32, sizeof(m32));
+        m22 = bitsToFloat(worldDepthM22Bits.load(std::memory_order_relaxed));
+        m32 = bitsToFloat(worldDepthM32Bits.load(std::memory_order_relaxed));
+        vpScaleZ = bitsToFloat(worldDepthVpScaleZBits.load(std::memory_order_relaxed));
+        vpTranslateZ = bitsToFloat(worldDepthVpTranslateZBits.load(std::memory_order_relaxed));
+        return true;
+    }
+
+    // Reticle bounds, accumulated while the frame's draws are matched and
+    // promoted at the start of the next pass. Render-thread only, but published
+    // through atomics to match the rest of the stereo bridge.
+    static float reticlePendingMinX = 0.0f, reticlePendingMaxX = 0.0f;
+    static float reticlePendingMinY = 0.0f, reticlePendingMaxY = 0.0f;
+    static bool reticlePendingAny = false;
+    static std::atomic<uint32_t> reticleCenterXBits{0};
+    static std::atomic<uint32_t> reticleCenterYBits{0};
+    static std::atomic<bool> reticleCenterValid{false};
+
+    void stereoAccumulateReticleBounds(float minX, float maxX, float minY, float maxY) {
+        if (!reticlePendingAny) {
+            reticlePendingMinX = minX;
+            reticlePendingMaxX = maxX;
+            reticlePendingMinY = minY;
+            reticlePendingMaxY = maxY;
+            reticlePendingAny = true;
+            return;
+        }
+
+        reticlePendingMinX = std::min(reticlePendingMinX, minX);
+        reticlePendingMaxX = std::max(reticlePendingMaxX, maxX);
+        reticlePendingMinY = std::min(reticlePendingMinY, minY);
+        reticlePendingMaxY = std::max(reticlePendingMaxY, maxY);
+    }
+
+    void stereoPromoteReticleBounds() {
+        if (reticlePendingAny) {
+            const float cx = (reticlePendingMinX + reticlePendingMaxX) * 0.5f;
+            const float cy = (reticlePendingMinY + reticlePendingMaxY) * 0.5f;
+            uint32_t bx, by;
+            std::memcpy(&bx, &cx, sizeof(bx));
+            std::memcpy(&by, &cy, sizeof(by));
+            reticleCenterXBits.store(bx, std::memory_order_relaxed);
+            reticleCenterYBits.store(by, std::memory_order_relaxed);
+            reticleCenterValid.store(true, std::memory_order_relaxed);
+        }
+        else {
+            // No reticle drawn last pass. Drop the position rather than leave a
+            // stale one: the next thing to need it may be a different scene.
+            reticleCenterValid.store(false, std::memory_order_relaxed);
+        }
+
+        reticlePendingAny = false;
+    }
+
+    bool stereoGetReticleCenter(float &x, float &y) {
+        if (!reticleCenterValid.load(std::memory_order_relaxed)) {
+            return false;
+        }
+
+        const uint32_t bx = reticleCenterXBits.load(std::memory_order_relaxed);
+        const uint32_t by = reticleCenterYBits.load(std::memory_order_relaxed);
+        std::memcpy(&x, &bx, sizeof(x));
+        std::memcpy(&y, &by, sizeof(y));
         return true;
     }
 
@@ -257,11 +328,25 @@ namespace RT64 {
     }
 
     // Convergence stays what it always was: the distance at which geometry sits
-    // exactly on the screen plane. It arrives in tenths of a slider unit
-    // (1..500 = 0.1..50), so the game-unit conversion is 2 per tenth: the
-    // 0.1..50 slider spans 2..1000 game units.
-    static float stereoConvergenceWorld(uint32_t convergenceTenths) {
-        return static_cast<float>(convergenceTenths) * 2.0f;
+    // exactly on the screen plane. It arrives in HUNDREDTHS of a slider unit
+    // (10..2000 = 0.1..20), and the 0.1..20 slider spans 2..400 game units, so
+    // one bridge unit is 0.2 game units.
+    //
+    // This was tenths (2 game units per step) and is the resolution the
+    // depth-driven loop's output is rounded to on its way back through the
+    // config bridge. At the close convergences auto-convergence pulls to, a
+    // 2-unit step is several percent of the applied value; the disparity it
+    // moves by is large enough to see, so the loop looked like it was stepping
+    // rather than easing even though its own solve is continuous. Nothing about
+    // the user-facing slider changed - it still moves in tenths.
+    //
+    // StereoAutoConvergence::update in the depth sampler applies this same
+    // conversion by hand and rounds its result back into these units. The two
+    // must stay in step, or the solve silently retunes itself.
+    static constexpr float ConvergenceWorldPerUnit = 0.2f;
+
+    static float stereoConvergenceWorld(uint32_t convergenceHundredths) {
+        return static_cast<float>(convergenceHundredths) * ConvergenceWorldPerUnit;
     }
 
     // DK64's horizontal projection scale at the aspect ratio the HUD constants
@@ -345,6 +430,75 @@ namespace RT64 {
         }
     }
 
+    // dynamic3d 6.1 - pop-out is not divergence, so the two directions do not
+    // get the same limit. Behind the screen plane the constraint is physical:
+    // uncrossed disparity past an IPD forces the eyes outward and cannot be
+    // fused. In front of it the eyes converge inward and there is nothing to
+    // protect against, so reusing the behind-limit would only clip valid
+    // pop-out.
+    //
+    // unsignedOffset is the EYE-INDEPENDENT term the shift was built from,
+    // positive when the element belongs BEHIND the screen plane. The branch has
+    // to be on that and not on ndcOffset: eyeSign is folded into the applied
+    // shift, so its sign encodes which eye rather than which side of the glass
+    // the element is on.
+    static float clampStereoNdcOffset(float ndcOffset, float unsignedOffset) {
+        constexpr float BehindNdcLimit = 0.10f;   // ~5% of eye width
+        constexpr float PopOutNdcLimit = 0.30f;   // ~15% of eye width
+        const float ndcLimit = (unsignedOffset > 0.0f) ? BehindNdcLimit : PopOutNdcLimit;
+        return std::max(-ndcLimit, std::min(ndcLimit, ndcOffset));
+    }
+
+    // Depth-aware crosshair (dynamic3d 5.1 / 1.2 in NDC).
+    //
+    // Zero at the convergence distance, tending to the full background
+    // disparity as the aim point recedes, and going negative (pop-out) nearer
+    // than convergence.
+    //
+    // NO orthographic scale factor here, unlike applyStereoHudShift below. That
+    // 2.75 is a HUD calibration - matched by eye so that text and icons sit at
+    // the same apparent depth whether they arrive through a perspective or an
+    // orthographic projection - and it answers a question about agreement
+    // between two UI paths. This function answers a different one: the reticle
+    // has to land on the same disparity the WORLD gets at the depth being aimed
+    // at, and that quantity is fixed by the projection, not by a UI convention.
+    // dynamic3d 5.1 records a port that inherited such a constant and put its
+    // reticle at 1.73x the world's disparity, correct at the convergence
+    // distance and visibly too deep through the mid range.
+    //
+    // Working the two stereo transforms through for a point at distance d:
+    //   off-axis shear  m[2][0] += eyeSign * separation
+    //                     -> dNDC.x = -eyeSign * separation      (constant)
+    //   view shift      m[3][0] += eyeSign * separation * conv / m00
+    //                     -> dNDC.x = +eyeSign * separation * conv / d
+    //   total             eyeSign * separation * (conv/d - 1)
+    //
+    // A non-positive aimViewZ means the sampler resolved nothing, and that
+    // resolves to INFINITY rather than to the screen plane. Aiming at open sky
+    // should leave the reticle sitting deep; one that snaps forward to the
+    // glass whenever a sample drops out is far more distracting, and the sample
+    // drops out exactly when there is nothing near to look at. Spelled out
+    // rather than left to fall out of the arithmetic, because it is a
+    // deliberate choice a later simplification could quietly undo.
+    float stereoAimRectOffsetX(StereoEye eye, float aimViewZ, uint32_t separationSlider,
+                               uint32_t convergenceHundredths) {
+        if ((eye == StereoEye::None) || (separationSlider == 0)) {
+            return 0.0f;
+        }
+
+        const float separation = stereoSeparation(separationSlider);
+        const float convergence = stereoConvergenceWorld(convergenceHundredths);
+        constexpr float AtInfinityRatio = 0.0f;
+        const float ratio = (aimViewZ > 0.0f) ? (convergence / aimViewZ) : AtInfinityRatio;
+        // Positive when the aim point is BEHIND the screen plane, which is the
+        // sense clampStereoNdcOffset branches on.
+        const float aimOffset = separation * (1.0f - ratio);
+        const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
+        // Negated to mirror applyStereoHudShift's orthographic branch, so the
+        // reticle moves in the same direction as every other rectangle.
+        return -clampStereoNdcOffset(eyeSign * aimOffset, aimOffset);
+    }
+
     // Apply a constant per-eye horizontal shift to a HUD/UI projection matrix so
     // it sits at a user-selected stereo depth instead of flat on the screen.
     // hudDepthSlider 0..100: 50 = screen plane (no shift), below = push behind
@@ -394,18 +548,7 @@ namespace RT64 {
             ndcOffset *= ReferenceProjectionScale;
         }
 
-        // dynamic3d 6.1 - pop-out is not divergence, so the two directions do
-        // not get the same limit. Behind the screen plane the constraint is
-        // physical: uncrossed disparity past an IPD forces the eyes outward and
-        // cannot be fused. In front of it the eyes converge inward and there is
-        // nothing to protect against, so reusing the behind-limit would only
-        // clip valid pop-out. Branch on hudOffset, which is eye-independent -
-        // the sign of the applied shift encodes which eye, not which side of
-        // the screen plane the element is on.
-        constexpr float BehindNdcLimit = 0.10f;   // ~5% of eye width
-        constexpr float PopOutNdcLimit = 0.30f;   // ~15% of eye width
-        const float ndcLimit = (hudOffset > 0.0f) ? BehindNdcLimit : PopOutNdcLimit;
-        ndcOffset = std::max(-ndcLimit, std::min(ndcLimit, ndcOffset));
+        ndcOffset = clampStereoNdcOffset(ndcOffset, hudOffset);
 
         if (isOrthographic) {
             projMatrix[3][0] -= eyeSign * ndcOffset;
@@ -429,7 +572,7 @@ namespace RT64 {
     // while background disparity stays fixed at `separation`. Anything that
     // wants a physical eye offset has to read it from here rather than assuming
     // the separation slider is one.
-    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceTenths, float projectionScale) {
+    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceHundredths, float projectionScale) {
         if (eye == StereoEye::None) {
             return;
         }
@@ -440,7 +583,7 @@ namespace RT64 {
             return;
         }
         const float tanHalfHorFov = 1.0f / projectionScale;
-        const float halfBaseline = stereoSeparation(separationSlider) * tanHalfHorFov * stereoConvergenceWorld(convergenceTenths);
+        const float halfBaseline = stereoSeparation(separationSlider) * tanHalfHorFov * stereoConvergenceWorld(convergenceHundredths);
         const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
         // For a row-vector view matrix, m[3][0] is the X translation in view
         // space. Adding to it shifts world points right in view space, which is
@@ -558,8 +701,32 @@ namespace RT64 {
                 // Publish this projection's depth terms for the depth sampler.
                 // The world projection is the one the sampled depth buffer was
                 // rendered with, so these are the right terms to invert it.
+                //
+                // The VIEWPORT's depth scale and translate go with them
+                // (dynamic3d 4.1). The buffer does not hold ndc.z: the RSP
+                // viewport applies its own scale and translate on top, and on
+                // the N64 that scale is a G_MAXZ fixed-point value slightly
+                // under a half rather than exactly a half. Assuming 0.5 reads near
+                // objects correctly and everything beyond progressively CLOSER
+                // than it is - about -5% at 100 units and -20% at 1000 - which
+                // shows up as a crosshair that sits short of mid-range targets
+                // and a convergence loop quietly over-pulling because it
+                // believes the scene is nearer than it is.
+                //
+                // Only published when the projection actually carries a
+                // viewport; an identity one would describe a depth range
+                // nothing was rendered with, so a zero scale is sent instead
+                // and stereoDeviceDepthToViewZ falls back to the 2*d-1 form.
                 if (isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
-                    stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2]);
+                    float vpScaleZ = 0.0f;
+                    float vpTranslateZ = 0.0f;
+                    if (proj.usesViewport()) {
+                        const interop::RSPViewport &depthViewport = drawData.rspViewports[proj.transformsIndex];
+                        vpScaleZ = depthViewport.scale[2];
+                        vpTranslateZ = depthViewport.translate[2];
+                    }
+
+                    stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2], vpScaleZ, vpTranslateZ);
                 }
             }
 
