@@ -19,7 +19,8 @@ namespace RT64 {
         StereoDepthSampler::FootprintRowTexels * StereoDepthSampler::PatchSize * DepthTexelSize;
     static constexpr uint32_t PatchBufferSize = PatchStride * StereoDepthSampler::PatchCount;
 
-    bool StereoDepthSampler::submit(RenderWorker *worker, RenderTarget *depthTarget) {
+    bool StereoDepthSampler::submit(RenderWorker *worker, RenderTarget *depthTarget,
+                                    uint32_t contentOriginX, uint32_t contentWidth) {
         if ((worker == nullptr) || (depthTarget == nullptr)) {
             return false;
         }
@@ -74,10 +75,24 @@ namespace RT64 {
         // enough to win the near statistic but marginal enough to drop in and
         // out of it, so the loop flips between two stable solves every few
         // frames.
+        //
+        // The horizontal margins are measured against the VISIBLE span, not the
+        // whole target. A wider-than-16:9 eye is cropped to its centred 16:9
+        // slice before the viewer sees it, so on a 32:9 desktop roughly a
+        // quarter of the target at each side is rendered and thrown away.
+        // Spreading the grid across all of it lets scenery well outside the
+        // frame win the near statistic and pull convergence in for no visible
+        // reason.
         const RenderTextureCopyLocation srcLocation = RenderTextureCopyLocation::Subresource(texture, 0);
-        const uint32_t usableW = (targetWidth * (100 - RoiMarginLeftPercent - RoiMarginRightPercent)) / 100;
+        // std::clamp is UB when lo > hi, so the available width is checked
+        // rather than assumed: a caller passing an origin close to the right
+        // edge would otherwise produce one.
+        const uint32_t spanX = std::min(contentOriginX, targetWidth - PatchSize);
+        const uint32_t spanAvail = targetWidth - spanX;
+        const uint32_t spanW = std::min(std::max(contentWidth, PatchSize), spanAvail);
+        const uint32_t usableW = (spanW * (100 - RoiMarginLeftPercent - RoiMarginRightPercent)) / 100;
         const uint32_t usableH = (targetHeight * (100 - RoiMarginTopPercent - RoiMarginBottomPercent)) / 100;
-        const uint32_t originX = (targetWidth * RoiMarginLeftPercent) / 100;
+        const uint32_t originX = spanX + ((spanW * RoiMarginLeftPercent) / 100);
         const uint32_t originY = (targetHeight * RoiMarginTopPercent) / 100;
 
         for (uint32_t row = 0; row < PatchRows; row++) {

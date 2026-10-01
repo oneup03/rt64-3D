@@ -12,6 +12,22 @@
 #include "rt64_vi_renderer.h"
 
 namespace RT64 {
+    void stereoEyeVisibleSpanX(float contentWidth, float contentHeight,
+                               float &outOriginX, float &outWidth) {
+        outOriginX = 0.0f;
+        outWidth = contentWidth;
+        if ((contentWidth <= 0.0f) || (contentHeight <= 0.0f)) {
+            return;
+        }
+
+        constexpr float kTargetEyeAspect = 16.0f / 9.0f;
+        const float contentAspect = contentWidth / contentHeight;
+        if (contentAspect > (kTargetEyeAspect + 1e-4f)) {
+            outWidth = contentWidth * (kTargetEyeAspect / contentAspect);
+            outOriginX = (contentWidth - outWidth) * 0.5f;
+        }
+    }
+
     StereoRenderer::StereoRenderer() { }
 
     StereoRenderer::~StereoRenderer() { }
@@ -121,23 +137,21 @@ namespace RT64 {
             texRes = { texW, texH };
             origin = { 0.0f, 0.0f };
 
-            // When the rendered view is wider than 16:9 per eye (typical on
-            // ultrawide / 32:9 desktops, where full-SbS AR glasses split the
-            // image into two 16:9 halves), crop each eye to its centered 16:9
-            // slice so the glasses see correctly-proportioned content instead
-            // of a horizontally squashed view. On 16:9 displays the content
-            // aspect is ~16:9 and this is a no-op.
+            // Crop a wider-than-16:9 eye to its centred 16:9 slice, so the
+            // glasses see correctly-proportioned content instead of a
+            // horizontally squashed view. See stereoEyeVisibleSpanX, which owns
+            // the rule; on 16:9 displays it is a no-op.
             //
             // Measured on the content rect, not the texture, or a partially
             // filled target would be judged by the wrong aspect. The origin is
             // in normalized TEXTURE uv, so the centering offset divides by texW
             // rather than contentW.
-            const float contentAspect = (contentH > 0.0f) ? (contentW / contentH) : 1.0f;
-            constexpr float kTargetEyeAspect = 16.0f / 9.0f;
-            if (contentAspect > kTargetEyeAspect + 1e-4f) {
-                const float croppedW = contentW * (kTargetEyeAspect / contentAspect);
-                videoRes = { croppedW, contentH };
-                origin = { ((contentW - croppedW) * 0.5f) / texW, 0.0f };
+            float visibleOriginX = 0.0f;
+            float visibleW = contentW;
+            stereoEyeVisibleSpanX(contentW, contentH, visibleOriginX, visibleW);
+            if (visibleW < contentW) {
+                videoRes = { visibleW, contentH };
+                origin = { visibleOriginX / texW, 0.0f };
             }
             };
 

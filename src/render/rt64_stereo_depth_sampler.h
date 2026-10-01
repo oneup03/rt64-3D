@@ -79,7 +79,15 @@ namespace RT64 {
         // per framebuffer PAIR and a frame has several - the world pass plus
         // smaller auxiliary ones whose depth is empty - so it is the caller's
         // job to offer only the main pass.
-        bool submit(RenderWorker *worker, RenderTarget *depthTarget);
+        //
+        // contentOriginX/contentWidth bound the part of the target the viewer
+        // actually sees, in texels -- see stereoEyeVisibleSpanX. Pass 0 and the
+        // full width when nothing is cropped. The patch grid is laid out inside
+        // that span rather than across the whole target: on an ultrawide the two
+        // are very different, and sampling the discarded margins lets geometry
+        // the player cannot see drive convergence.
+        bool submit(RenderWorker *worker, RenderTarget *depthTarget,
+                    uint32_t contentOriginX, uint32_t contentWidth);
 
         struct Sample {
             bool valid = false;

@@ -8,6 +8,7 @@
 
 #include "rt64_present_queue.h"
 #include "render/rt64_stereo_depth_sampler.h"
+#include "render/rt64_stereo_renderer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -177,6 +178,25 @@ namespace RT64 {
             if ((ext.sharedResources->swapChainWidth > 0) && (ext.sharedResources->swapChainHeight > 0)) {
                 const float derivedRatioTarget = float(ext.sharedResources->swapChainWidth) / float(ext.sharedResources->swapChainHeight);
                 workloadConfig.aspectRatioTarget = std::max(derivedRatioTarget, workloadConfig.aspectRatioSource);
+
+                // In stereo each eye is SHOWN at 16:9 however wide the display
+                // is, so rendering an eye wider than that is work thrown away.
+                //
+                // The compose crops a wider-than-16:9 eye to its centred 16:9
+                // slice, which is what makes a full-SbS 32:9 panel show two
+                // correctly proportioned halves instead of two squashed ones.
+                // Deriving the target from the whole 5120x1440 panel therefore
+                // had each eye render 5120x1440 and then throw half of it away.
+                //
+                // Capping produces the same image for half the cost, and leaves
+                // the crop downstream a no-op. The crop stays, as the backstop
+                // for Manual -- an explicit aspect the user picked, which this
+                // must not quietly override.
+                if (ext.sharedResources->userConfig.stereoMode != UserConfiguration::StereoMode::Off) {
+                    constexpr float kMaxStereoEyeAspect = 16.0f / 9.0f;
+                    workloadConfig.aspectRatioTarget = std::max(workloadConfig.aspectRatioSource,
+                        std::min(workloadConfig.aspectRatioTarget, kMaxStereoEyeAspect));
+                }
             }
             else {
                 workloadConfig.aspectRatioTarget = workloadConfig.aspectRatioSource;
@@ -964,7 +984,15 @@ namespace RT64 {
                             (depthTarget->width * 2 >= colorTarget->width) &&
                             (depthTarget->height * 2 >= colorTarget->height);
                         if (mainPass) {
-                            const bool submitted = stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget);
+                            // Hold the sampler to what the compose will actually
+                            // show: a wider-than-16:9 eye is cropped to its
+                            // centred 16:9 slice on the way to the screen.
+                            float visibleOriginX = 0.0f;
+                            float visibleWidth = float(depthTarget->width);
+                            stereoEyeVisibleSpanX(float(depthTarget->width), float(depthTarget->height),
+                                visibleOriginX, visibleWidth);
+                            const bool submitted = stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget,
+                                uint32_t(visibleOriginX), uint32_t(visibleWidth));
                             stereoDepthSampledThisPass = stereoDepthSampledThisPass || submitted;
                             if (submitted) {
                                 const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
