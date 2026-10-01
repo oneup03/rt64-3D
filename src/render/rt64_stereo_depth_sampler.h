@@ -1,0 +1,151 @@
+//
+// RT64
+//
+
+#pragma once
+
+#include <array>
+#include <memory>
+
+#include "rt64_render_target.h"
+
+namespace RT64 {
+    // Reads back a sparse grid of depth-buffer patches, for the depth-driven
+    // auto-convergence loop (dynamic3d 4.1).
+    //
+    // The copy is queued on the render thread and read back several frames
+    // later out of a ring of readback buffers, rather than stalling the GPU the
+    // way RT64's framebuffer-change readback does (end/execute/wait/begin).
+    // A per-frame full pipeline flush would cost more than this feature is
+    // worth, and a few frames of latency is invisible on a value that is
+    // temporally smoothed anyway.
+    //
+    // Depth arrives in DEVICE units (the depth target is D32_FLOAT). Converting
+    // that to a view-space distance needs the projection's own near/far
+    // handedness, which dynamic3d 4.1 explicitly warns not to assume - see
+    // stereoDeviceDepthToViewZ.
+    //
+    // Ported from Donkey-Kong-64-3D, minus its aim-depth window: that fed a
+    // depth-aware crosshair, which Goemon has no equivalent of. If one is ever
+    // added, the extra contiguous patches go back in here alongside the grid.
+    struct StereoDepthSampler {
+        // Square patch of depth texels. Several of these are copied per frame
+        // rather than one big region: dynamic3d 4.1 wants the NEAR statistic
+        // taken over a wide region of interest, but a contiguous copy covering
+        // most of a 4K depth target would move tens of megabytes a frame. A
+        // sparse grid of small patches spans the same area for a fraction of it.
+        //
+        // A single centre patch is not enough on its own - the middle of the
+        // screen is mid-distance scenery while the player and the near
+        // foreground sit elsewhere in frame.
+        static constexpr uint32_t PatchSize = 32;
+        // Frame edges excluded from the near statistic, as percentages. The
+        // bottom margin is much larger than the top: see the placement code in
+        // the .cpp for why the box has to be asymmetric rather than merely
+        // wide. Raising RoiMarginBottomPercent excludes more low-frame clutter
+        // at the cost of ignoring genuinely near floor when looking down.
+        static constexpr uint32_t RoiMarginLeftPercent = 5;
+        static constexpr uint32_t RoiMarginRightPercent = 5;
+        static constexpr uint32_t RoiMarginTopPercent = 5;
+        static constexpr uint32_t RoiMarginBottomPercent = 25;
+        // Grid spanning the middle of the frame. 45 patches of 32x32 is ~46k
+        // depth texels per frame - still a small fraction of a 4K depth target,
+        // and dense enough that a near object anywhere in frame lands in
+        // several of them rather than being missed between samples.
+        static constexpr uint32_t PatchCols = 9;
+        static constexpr uint32_t PatchRows = 5;
+        static constexpr uint32_t PatchCount = PatchCols * PatchRows;
+        // Footprint rows must be 256-byte aligned for the buffer copy, and the
+        // depth format is 4 bytes per texel, so the footprint is padded out to
+        // 64 texels per row and only the first PatchSize of each are read.
+        static constexpr uint32_t FootprintRowTexels = 64;
+        // Frames of slack between queueing a copy and reading it. Enough that
+        // the GPU has long since finished without needing an explicit fence.
+        static constexpr uint32_t SlotCount = 4;
+
+        struct Slot {
+            std::unique_ptr<RenderBuffer> buffer;
+            bool queued = false;
+        };
+
+        std::array<Slot, SlotCount> slots;
+        uint32_t frameIndex = 0;
+
+        // Queue a copy of this frame's depth patches. Safe to call with a null
+        // or multisampled target; it simply does nothing.
+        //
+        // Returns true only when a copy was actually queued, so the caller can
+        // avoid reading back on a frame it did not sample. The caller runs once
+        // per framebuffer PAIR and a frame has several - the world pass plus
+        // smaller auxiliary ones whose depth is empty - so it is the caller's
+        // job to offer only the main pass.
+        bool submit(RenderWorker *worker, RenderTarget *depthTarget);
+
+        struct Sample {
+            bool valid = false;
+            // Robust NEAR depth: a low percentile rather than the minimum, so a
+            // single stray texel from a particle or a sliver of geometry cannot
+            // slam convergence to the floor (dynamic3d 4.1).
+            float nearestDeviceDepth = -1.0f;
+        };
+
+        // Read back the oldest completed copy.
+        Sample fetch();
+    };
+
+    // Depth-driven auto-convergence (dynamic3d 4.2 - 4.5).
+    //
+    // Keeps the nearest significant on-screen object's pop-out under a comfort
+    // budget by pulling convergence in, without the player having to chase the
+    // slider. The manual value is always a CEILING: this only ever moves the
+    // screen plane closer, never further, so the slider still does what the user
+    // expects.
+    //
+    // Under the clip-space parameterization this is a single closed form with no
+    // co-scaling of separation: convergence no longer changes background
+    // disparity, so there is nothing to hold constant while pulling in.
+    struct StereoAutoConvergence {
+        // Longer than dynamic3d's suggested 5. The two-level near statistic is
+        // deliberately sensitive to small objects, so it legitimately jumps as
+        // one enters or leaves a patch; a wider temporal median rejects those
+        // transients without slowing the response to real approach.
+        static constexpr uint32_t HistorySize = 9;
+
+        float history[HistorySize] = {};
+        uint32_t historyCount = 0;
+        uint32_t historyCursor = 0;
+        float zEma = -1.0f;
+        float invConvSmoothed = -1.0f;
+        // Consecutive frames the depth has sat far away from the EMA. A camera
+        // cut stays changed; a small object flickering in and out of a patch
+        // does not, so the snap only fires once this persists.
+        uint32_t cutCandidateFrames = 0;
+
+        // nearestViewZ: robust near-depth for this frame, in game units.
+        // manualConvergence / separationSlider: the user's settings, in game
+        //   units and slider points respectively.
+        // Returns the convergence to apply, in game units, which is the manual
+        // value when there is nothing to protect against. Continuous rather
+        // than rounded - see ProjectionProcessor::stereoConvergenceAuto.
+        // comfortTarget: permitted pop-out in thousandths of screen width.
+        //   Signed - negative puts the screen plane in front of the nearest
+        //   object, so the whole scene sits behind the screen.
+        // sceneWantsLowConvergence: the game reports a close-framed scene, which
+        //   tightens the budget further.
+        float update(float nearestViewZ, uint32_t manualConvergence, uint32_t separationSlider,
+                     int32_t comfortTarget, bool sceneWantsLowConvergence);
+
+        // Snap back to the manual value rather than easing out, which would read
+        // as unexplained drift after the user turns the feature off.
+        void reset();
+    };
+
+    // Convert a device depth value to a positive view-space distance, given the
+    // two depth-related elements of the projection the frame was rendered with
+    // (m[2][2] and m[3][2]) and the RSP viewport's depth scale and translate
+    // (vpScaleZ 0 = no viewport, fall back to the nominal remap). Returns <= 0
+    // when the sample is invalid (cleared depth, degenerate projection). Taking
+    // scalars rather than the matrix keeps this header free of interop types.
+    float stereoDeviceDepthToViewZ(float deviceDepth, float projM22, float projM32,
+                                   float vpScaleZ, float vpTranslateZ);
+}

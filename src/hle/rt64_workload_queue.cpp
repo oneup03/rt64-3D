@@ -7,10 +7,48 @@
 #include "common/rt64_thread.h"
 
 #include "rt64_present_queue.h"
+#include "render/rt64_stereo_depth_sampler.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
 
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
 
 namespace RT64 {
+    // Depth readback for the depth-driven auto-convergence loop.
+    //
+    // The copy is issued from inside the framebuffer loop, which looks like
+    // recording a texture copy during an active render pass - it is not, plume's
+    // copyTextureRegion ends the pass itself. What DOES need care is plume's
+    // Vulkan backend, which only implemented buffer -> image copies; every other
+    // combination fell through to a generic branch that dereferences the
+    // destination texture, null when the destination is a buffer. D3D12 was fine
+    // throughout. The missing image -> buffer path is implemented in
+    // plume_vulkan.cpp.
+
+    // Convergence the depth loop wants, in game units as float bits, or 0 when
+    // it has nothing to say and the user's manual value should stand. Written on
+    // the render thread where the depth is sampled and read a few hundred lines
+    // earlier in the same loop on the following frame, hence the atomic.
+    static std::atomic<uint32_t> stereoAutoConvergenceBits{0};
+
+    static void stereoStoreAutoConvergence(float convergence) {
+        uint32_t bits = 0;
+        if (convergence > 0.0f) {
+            std::memcpy(&bits, &convergence, sizeof(bits));
+        }
+        stereoAutoConvergenceBits.store(bits, std::memory_order_relaxed);
+    }
+
+    static float stereoLoadAutoConvergence() {
+        const uint32_t bits = stereoAutoConvergenceBits.load(std::memory_order_relaxed);
+        float convergence = 0.0f;
+        std::memcpy(&convergence, &bits, sizeof(convergence));
+        return convergence;
+    }
+
     // WorkloadQueue
 
     WorkloadQueue::WorkloadQueue() {
@@ -320,6 +358,14 @@ namespace RT64 {
             projParams.stereoMode = stereoMode;
             projParams.stereoSeparation = ext.sharedResources->userConfig.stereoSeparation;
             projParams.stereoConvergence = ext.sharedResources->userConfig.stereoConvergence;
+
+            // Depth-driven auto-convergence overrides the manual value when it
+            // has something to say. It only ever pulls convergence IN - the
+            // manual slider stays the ceiling - so this cannot push the screen
+            // plane further out than the user asked for.
+            if (ext.sharedResources->userConfig.stereoAutoConvergence != 0) {
+                projParams.stereoConvergenceAuto = stereoLoadAutoConvergence();
+            }
             projParams.stereoHudDepth = ext.sharedResources->userConfig.stereoHudDepth;
             // Caller selects which eye this pass renders. The two-pass driver in
             // renderThreadLoop runs this function twice with Left then Right when
@@ -661,69 +707,43 @@ namespace RT64 {
                     if ((stereoMode != UserConfiguration::StereoMode::Off) &&
                         (stereoEye != StereoEye::None)) {
                         const float eyeSign = (stereoEye == StereoEye::Left) ? +1.0f : -1.0f;
+                        const auto &stereoCfg = ext.sharedResources->userConfig;
 
-                        const auto hudDepth = ext.sharedResources->userConfig.stereoHudDepth;
-                        if (hudDepth != 50) {
-                            const float centered = (static_cast<float>(hudDepth) - 50.0f) / 50.0f;
-                            constexpr float maxHudOffset = 0.04f;
-                            const float hudOffset = -centered * maxHudOffset;
-                            constexpr float perspectiveToOrthoScale = 2.75f;
-                            // Negation mirrors applyStereoHudShift's orthographic
-                            // branch so rectangles shift in the same direction
-                            // as everything else.
-                            drawParams.stereoRectOffsetX = -eyeSign * hudOffset * perspectiveToOrthoScale;
+                        // HUD depth for screen-space rectangles. Uses the same
+                        // helper the orthographic projection path uses, so the
+                        // separation scaling and the asymmetric near/behind
+                        // clamps cannot drift between the two. The negation
+                        // mirrors applyStereoHudShift's orthographic branch so
+                        // rectangles shift in the same direction as everything
+                        // else.
+                        if (stereoCfg.stereoHudDepth != 50) {
+                            drawParams.stereoRectOffsetX =
+                                -eyeSign * stereoHudOrthoNdcOffset(stereoCfg.stereoHudDepth, stereoCfg.stereoSeparation);
                         }
 
-                        // Skybox rect parallax: match the world projection's
-                        // analytic "infinity" — the NDC.x shift that the
-                        // world's per-eye perspective produces for a point at
-                        // depth -> infinity. That's exactly the asymptote
-                        // applyStereoOffAxis drives world geometry toward.
+                        // Skybox rect parallax, under clip space (dynamic3d
+                        // 1.2, the z -> infinity limit).
                         //
-                        // Pinning the 2D background to that value (rather than
-                        // a fixed user-tuned constant) means the skybox sits
-                        // at the same perceived depth as the farthest world
-                        // points, no matter what the player is looking at.
-                        // Distant mountains and the painted sky behind them
-                        // share a depth budget, so monoscopic cues (texture
+                        // The per-eye NDC x offset of a point at infinity is
+                        // exactly `separation` - that is what the clip-space
+                        // parameterization means. Pinning the 2D background to
+                        // it puts the sky at the same perceived depth as the
+                        // farthest world points, so monoscopic cues (texture
                         // scroll, scene parallax during player movement) and
                         // stereoscopic cues agree.
                         //
-                        // Derivation:
-                        //   world eyeOffset = 0.5 * sep_world / conv_world
-                        //                   capped at maxEyeOffset (0.08)
-                        //   NDC shift at infinity = eyeOffset * m[0][0]
-                        //   m[0][0] ~= 1 / (aspect * tan(fovy/2))
-                        // We don't have the projection matrix here, so we use
-                        // a fixed FOV-scale approximation matching Goemon's
-                        // typical perspective (~60deg FOV at 4:3).
+                        // The previous form computed 0.5 * sep_world / conv_world
+                        // capped at 0.08, times a hardcoded 1.3 standing in for
+                        // m[0][0] at 4:3. Both the FoV approximation and the
+                        // convergence dependence are gone: the sky no longer
+                        // drifts closer as the user pushes the screen plane out,
+                        // and it no longer needs a guess at the projection.
                         //
-                        // Tradeoff vs the previous fixed-constant formula:
-                        // brings back a soft convergence dependence. With
-                        // convergence in the denominator, raising convergence
-                        // pulls the skybox slightly closer (smaller eyeOffset).
-                        // PD's "stars" approach calls this out as the cost of
-                        // matching world analytics; in exchange the skybox
-                        // never drifts away from the world's depth budget.
-                        const auto separation = ext.sharedResources->userConfig.stereoSeparation;
-                        const auto convergence = ext.sharedResources->userConfig.stereoConvergence;
-                        if (separation > 0) {
-                            constexpr float kSeparationWorldScale = 0.02f;
-                            constexpr float kConvergenceWorldScale = 20.0f;
-                            constexpr float kMaxEyeOffset = 0.08f;
-                            constexpr float kFovScaleApprox = 1.3f;
-                            const float separationWorld =
-                                static_cast<float>(separation) * kSeparationWorldScale;
-                            const float convergenceWorld = std::max(
-                                static_cast<float>(convergence) * kConvergenceWorldScale, 1.0f);
-                            float eyeOffset = 0.5f * separationWorld / convergenceWorld;
-                            if (eyeOffset > kMaxEyeOffset) eyeOffset = kMaxEyeOffset;
-                            const float skyboxNdc = eyeOffset * kFovScaleApprox;
-                            // -eyeSign so positive parallax (sky behind) lands
-                            // in the same screen-space direction as the
-                            // rect/ortho HUD's "behind" convention.
-                            drawParams.stereoSkyboxRectOffsetX = -eyeSign * skyboxNdc;
-                        }
+                        // -eyeSign so positive parallax (sky behind) lands in
+                        // the same screen-space direction as the rect/ortho
+                        // HUD's "behind" convention.
+                        drawParams.stereoSkyboxRectOffsetX =
+                            -eyeSign * stereoSeparationFraction(stereoCfg.stereoSeparation);
                     }
                     framebufferRenderer->addFramebuffer(drawParams);
                 }
@@ -792,6 +812,11 @@ namespace RT64 {
             
             // Record all framebuffer pairs.
             uint32_t framebufferIndex = 0;
+            // The depth sampler takes at most one framebuffer pair per pass:
+            // only the world pair carries usable depth, and every extra submit
+            // advances the readback ring so the fetch stops lining up with the
+            // copy.
+            bool stereoDepthSampledThisPass = false;
             for (uint32_t f = 0; f < fbPairCount; f++) {
                 const FramebufferPair &fbPair = workload.fbPairs[f];
                 bool validTargets = getTargetsFromPair(f);
@@ -889,6 +914,80 @@ namespace RT64 {
                     else {
                         RenderTarget *chosenTarget = (colorTarget != nullptr) ? colorTarget : depthTarget;
                         ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(chosenTarget->texture.get(), RenderTextureLayout::SHADER_READ));
+                    }
+
+                    // Depth sampling for the depth-driven auto-convergence loop
+                    // (dynamic3d 4.1). Render-thread only, so no locking.
+                    //
+                    // This loop runs once per framebuffer pair and a frame has
+                    // several. Only the world pass carries usable depth; the
+                    // smaller auxiliary passes are empty there, so sampling
+                    // every pair would produce a stream that is invalid most of
+                    // the time. Require the depth target to be comparable in
+                    // size to the colour target, and let the sampler take only
+                    // the first such pass per frame - reading back only when it
+                    // actually sampled.
+                    {
+                        // Auxiliary passes are much smaller than the world pass;
+                        // half the colour target's dimensions separates them
+                        // without needing an exact match.
+                        //
+                        // Only the left eye is sampled. In stereo the world is
+                        // rendered twice and both passes produce a full-size
+                        // depth target, so taking both would interleave two
+                        // series that differ by the eye disparity - enough to
+                        // make anything driven from this jitter every frame.
+                        //
+                        // Nothing is sampled unless stereo is on AND the loop is
+                        // enabled, so mono play and manual convergence never
+                        // pay for the copy - or touch the readback path at all.
+                        // Turning the loop off snaps it back immediately, so
+                        // re-enabling starts fresh rather than from a stale EMA.
+                        static StereoDepthSampler stereoDepthSampler;
+                        static StereoAutoConvergence stereoAutoConvergence;
+                        const auto &samplerCfg = ext.sharedResources->userConfig;
+                        const bool samplerWanted = (samplerCfg.stereoMode != UserConfiguration::StereoMode::Off) &&
+                            (samplerCfg.stereoAutoConvergence != 0);
+                        if (!samplerWanted) {
+                            stereoAutoConvergence.reset();
+                            stereoStoreAutoConvergence(0.0f);
+                        }
+                        // A COLOUR target is required (from DK64-3D): games emit
+                        // depth-only pairs alongside the world pass, and a null
+                        // colour target used to short-circuit the size test and
+                        // let them through. Their patches are empty, and every
+                        // extra submit also advances the readback ring out of
+                        // step with the copy, hence the once-per-pass guard too.
+                        const bool sampledEye = (stereoEye != StereoEye::Right);
+                        const bool mainPass = samplerWanted && sampledEye && !stereoDepthSampledThisPass &&
+                            (depthTarget != nullptr) && (colorTarget != nullptr) &&
+                            (depthTarget->width * 2 >= colorTarget->width) &&
+                            (depthTarget->height * 2 >= colorTarget->height);
+                        if (mainPass) {
+                            const bool submitted = stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget);
+                            stereoDepthSampledThisPass = stereoDepthSampledThisPass || submitted;
+                            if (submitted) {
+                                const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
+
+                                // Invert the sampled depth with the projection
+                                // the frame was actually rendered with, rather
+                                // than assuming a nominal near/far.
+                                float projM22 = 0.0f;
+                                float projM32 = 0.0f;
+                                float vpScaleZ = 0.0f;
+                                float vpTranslateZ = 0.0f;
+                                const auto &cfg = ext.sharedResources->userConfig;
+                                if (sample.valid && stereoGetWorldDepthTerms(projM22, projM32, vpScaleZ, vpTranslateZ)) {
+                                    const float nearestZ = stereoDeviceDepthToViewZ(sample.nearestDeviceDepth,
+                                        projM22, projM32, vpScaleZ, vpTranslateZ);
+                                    // Ceiling is the user's UNSCALED slider, so
+                                    // it stays put while the loop works.
+                                    stereoStoreAutoConvergence(
+                                        stereoAutoConvergence.update(nearestZ, cfg.stereoConvergenceManual, cfg.stereoSeparation,
+                                            cfg.stereoComfortTarget, cfg.stereoSceneLowConvergence != 0));
+                                }
+                            }
+                        }
                     }
 
                     // Do the resolve if using MSAA while target override is active and we're on the correct framebuffer pair index.

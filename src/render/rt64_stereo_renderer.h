@@ -67,6 +67,11 @@ namespace RT64 {
             // pillarbox through to the SbS output. Defaults to 1 (no
             // adjustment) which preserves the previous behavior.
             float aspectRatioScale = 1.0f;
+            // Ghost-reduction levers forwarded to the compose shader. Defaults
+            // are the exact no-ops, so a caller that doesn't set them gets the
+            // untouched image.
+            float ghostContrast = 1.0f;
+            float ghostBlackFloor = 0.0f;
         };
 
         StereoRenderer();

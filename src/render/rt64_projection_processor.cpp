@@ -4,13 +4,56 @@
 
 #include "rt64_projection_processor.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 
 #include "../include/rt64_extended_gbi.h"
 #include "common/rt64_math.h"
 #include "hle/rt64_workload_queue.h"
 
 namespace RT64 {
+    // The world projection's two depth terms, published from the render thread
+    // and read by the depth sampler on the same thread a frame later. Stored as
+    // raw bits so the pair can be atomics without needing a lock.
+    static std::atomic<uint32_t> worldDepthM22Bits{0};
+    static std::atomic<uint32_t> worldDepthM32Bits{0};
+    static std::atomic<uint32_t> worldDepthVpScaleZBits{0};
+    static std::atomic<uint32_t> worldDepthVpTranslateZBits{0};
+    static std::atomic<bool> worldDepthTermsValid{false};
+
+    static uint32_t floatToBits(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
+    static float bitsToFloat(uint32_t bits) {
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    void stereoPublishWorldDepthTerms(float m22, float m32, float vpScaleZ, float vpTranslateZ) {
+        worldDepthM22Bits.store(floatToBits(m22), std::memory_order_relaxed);
+        worldDepthM32Bits.store(floatToBits(m32), std::memory_order_relaxed);
+        worldDepthVpScaleZBits.store(floatToBits(vpScaleZ), std::memory_order_relaxed);
+        worldDepthVpTranslateZBits.store(floatToBits(vpTranslateZ), std::memory_order_relaxed);
+        worldDepthTermsValid.store(true, std::memory_order_relaxed);
+    }
+
+    bool stereoGetWorldDepthTerms(float &m22, float &m32, float &vpScaleZ, float &vpTranslateZ) {
+        if (!worldDepthTermsValid.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        m22 = bitsToFloat(worldDepthM22Bits.load(std::memory_order_relaxed));
+        m32 = bitsToFloat(worldDepthM32Bits.load(std::memory_order_relaxed));
+        vpScaleZ = bitsToFloat(worldDepthVpScaleZBits.load(std::memory_order_relaxed));
+        vpTranslateZ = bitsToFloat(worldDepthVpTranslateZBits.load(std::memory_order_relaxed));
+        return true;
+    }
+
     inline void adjustProjectionMatrix(interop::float4x4 &matrix, const float aspectRatioScale) {
         matrix[0][0] *= aspectRatioScale;
         matrix[1][0] *= aspectRatioScale;
@@ -84,37 +127,142 @@ namespace RT64 {
         return (matrixId == GOEMON_PROJECTION_HUD_TRANSFORM_ID);
     }
 
-    // Convert the user-facing 0..100 sliders to world-space stereo parameters.
-    // Centralised here so applyStereoOffAxis and applyStereoViewShift always agree.
+    // dynamic3d 1.3 - the clip-space stereo parameterization.
     //
-    // Goemon uses smaller world-space distances than other N64 ports (cameras
-    // typically sit much closer to the action), so the same slider value
-    // produces ~50x more apparent disparity than it would in a game like
-    // Banjo. The 0.02 multiplier on separation compresses the slider so
-    // default (50) produces the comfortable eye-offset (~0.025) that the
-    // playtester landed on after manually setting slider=1; the full 1..100
-    // range then maps to "subtle .. clearly visible" rather than
-    // "barely-anything .. eye-strain".
-    static void stereoWorldUnits(uint32_t separationSlider, uint32_t convergenceSlider,
-                                 float &separationWorld, float &convergenceWorld) {
-        separationWorld = static_cast<float>(separationSlider) * 0.02f;             // 0..2 game units
-        convergenceWorld = static_cast<float>(convergenceSlider) * 20.0f;           // 20..2000 game units (slider min 1)
+    // `separation` IS the stereo knob: the per-eye projection shear is exactly
+    // this value, with no FoV term and no convergence term folded into it.
+    // Because the shear is the NDC x offset at infinity, the number means
+    // something the user can see:
+    //
+    //     total background disparity = separation x screen width
+    //
+    // The 0..50 slider maps linearly onto 0..0.10 of screen width, so each
+    // point is 0.2% of the screen. The default (10 -> 0.020) is a comfortable
+    // 2%, and the top of the range is roughly the divergence ceiling - where
+    // background disparity reaches an adult IPD, the eyes are forced outward,
+    // and no amount of practice can fuse it. That ceiling is IPD / screen
+    // width: about 0.105 on a 27-inch 16:9 monitor and proportionally lower on
+    // anything bigger (~0.05 on a 55-inch TV). Values past it stay reachable
+    // because the physical screen size is not visible from here.
+    //
+    // This replaces the previous world-units form, where separation was a
+    // game-unit eye offset and the shear was (sep / 2 / conv) * m[0][0]. That
+    // form needed a per-game compression constant (Goemon's world units are
+    // ~50x smaller than Banjo's, hence the old 0.02 multiplier) purely to get
+    // the slider into a usable range, and it rode on the live projection scale,
+    // so the depth effect quietly tracked the output aspect ratio - RT64
+    // narrows m[0][0] by 1/aspectRatioScale for widescreen, so about a quarter
+    // of the effect was lost going from 16:9 to 21:9. Clip space is invariant
+    // to both, and to any in-game FoV change, by construction. That also means
+    // the slider now means the same thing here as it does in the sibling ports,
+    // so a value that is comfortable in one is comfortable in the others.
+    //
+    // The slider-to-fraction constant itself lives in the header as
+    // StereoSeparationPerSlider, alongside StereoHudReferenceSeparation - the
+    // separation the empirical HUD offsets were tuned at (the shipped default,
+    // so the HUD lands at exactly the depth it did before this migration, and
+    // scales with the depth knob away from it) - because the texture-rectangle
+    // path in rt64_workload_queue.cpp has to use the same numbers.
+    float stereoSeparationFraction(uint32_t separationSlider) {
+        return static_cast<float>(separationSlider) * StereoSeparationPerSlider;
     }
 
-    static void applyStereoOffAxis(interop::float4x4 &projMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceSlider) {
+    // Convergence stays what it always was: the distance at which geometry sits
+    // exactly on the screen plane. It is a DISTANCE, not a disparity, so it
+    // needs no calibration against the projection and no FoV term - and unlike
+    // separation it is inherently per-game, because it is measured in the
+    // game's own units. Goemon's cameras sit close to the action, so the useful
+    // band is roughly 10..100 units and the slider is carried straight through
+    // in game units rather than scaled.
+    static float stereoConvergenceWorld(uint32_t convergenceSlider) {
+        return static_cast<float>(convergenceSlider);
+    }
+
+    // The convergence actually applied: the slider, or the depth loop's pull-in
+    // when it has one. The loop's value is already bounded by the slider on the
+    // way out, but take the min here too so this can never push the screen
+    // plane further than the user asked for.
+    static float stereoEffectiveConvergence(uint32_t convergenceSlider, float convergenceAuto) {
+        const float manual = stereoConvergenceWorld(convergenceSlider);
+        return (convergenceAuto > 0.0f) ? std::min(convergenceAuto, manual) : manual;
+    }
+
+    // Goemon's horizontal projection scale at the aspect ratio the HUD
+    // constants below were tuned at (16:9). Used in place of the live m[0][0]
+    // so HUD depth stops tracking the output aspect ratio.
+    //
+    // Derived rather than measured: the shipped skybox-rect code in
+    // rt64_workload_queue.cpp carried 1.3 as Goemon's m[0][0] for the game's
+    // native 4:3 perspective (~60 degree vertical FoV: cot(30) / (4/3) = 1.299).
+    // RT64 then multiplies the projection by projRatioScale = 1/aspectRatioScale
+    // for widescreen, which at 16:9 is (4/3)/(16/9) = 0.75, giving 1.3 * 0.75.
+    // Only the HUD offsets ride on this, so being a few percent off shifts HUD
+    // depth slightly and nothing else; the world path uses the live m[0][0].
+    //
+    // Deliberately frozen: using the live value would make HUD depth track both
+    // the window shape and any in-game FoV change.
+    static constexpr float ReferenceProjectionScale = 0.975f;
+
+    // dynamic3d 1.1 - the shear is the knob.
+    //
+    // The old cap on the shear term is gone along with the world-units form. It
+    // existed because sep / (2 * conv) genuinely grows without bound as
+    // convergence approaches zero; the shear is now just `separation`, which
+    // the slider range already bounds, so there is nothing left for the cap to
+    // protect against (dynamic3d 2.4).
+    static void applyStereoOffAxis(interop::float4x4 &projMatrix, StereoEye eye, uint32_t separationSlider) {
         if (eye == StereoEye::None) {
             return;
         }
-        float separationWorld;
-        float convergenceWorld;
-        stereoWorldUnits(separationSlider, convergenceSlider, separationWorld, convergenceWorld);
-        float eyeOffset = 0.5f * separationWorld / convergenceWorld;
-        constexpr float maxEyeOffset = 0.08f;
-        if (eyeOffset > maxEyeOffset) eyeOffset = maxEyeOffset;
         const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
         // Adds an asymmetric horizontal shift to the projection's principal point.
         // Equivalent to rebuilding the frustum with [L,R] = [-horFov+offset, horFov+offset].
-        projMatrix[2][0] += eyeSign * eyeOffset * projMatrix[0][0];
+        projMatrix[2][0] += eyeSign * stereoSeparationFraction(separationSlider);
+    }
+
+    // The per-eye NDC x offset for a HUD element at the configured HUD depth,
+    // before the eye sign. Split out of applyStereoHudShift because the
+    // texture-rectangle path in rt64_workload_queue.cpp has to produce exactly
+    // the same number for 2D draws that never pass through a projection matrix.
+    static float stereoHudNdcOffset(uint32_t hudDepthSlider, uint32_t separationSlider, bool isOrthographic) {
+        const float centered = (static_cast<float>(hudDepthSlider) - 50.0f) / 50.0f; // -1..+1
+        // Negate so slider > 50 produces pop-out (negative parallax) and
+        // slider < 50 produces push-back (positive parallax).
+        //
+        // dynamic3d 5.2: a layer parked at a fixed multiple of the convergence
+        // distance has a shift of separation * (1/factor - 1) - proportional to
+        // separation, and independent of convergence. Scaling by separation is
+        // what makes HUD depth track the depth knob, and what makes the HUD go
+        // properly flat when separation is 0 (the old fixed offset split the
+        // HUD even with the 3D effect dialled all the way down).
+        const float separationScale = stereoSeparationFraction(separationSlider) / StereoHudReferenceSeparation;
+        const float hudOffset = -centered * StereoHudMaxOffset * separationScale;
+
+        // Map onto an NDC x offset, per projection type:
+        //   Perspective: m[2][0] += K becomes a constant NDC shift of K after
+        //     the perspective divide. Scaled by the REFERENCE projection term
+        //     rather than the live one so the depth holds across aspect ratios.
+        //   Orthographic: no perspective divide, so m[3][0] += K shifts NDC by
+        //     +K directly, and the caller flips the sign to keep the slider
+        //     pushing both projection types the same way. The 2.75 was matched
+        //     by eye against the perspective path so ortho and perspective UI
+        //     sit at the same depth at the same slider value.
+        float ndcOffset = hudOffset * (isOrthographic ? StereoHudOrthoScale : ReferenceProjectionScale);
+
+        // dynamic3d 6.1 - pop-out is not divergence, so the two directions do
+        // not get the same limit. Behind the screen plane the constraint is
+        // physical: uncrossed disparity past an IPD forces the eyes outward and
+        // cannot be fused. In front of it the eyes converge inward and there is
+        // nothing to protect against, so reusing the behind-limit would only
+        // clip valid pop-out. Branch on hudOffset, which is eye-independent -
+        // the sign of the APPLIED shift encodes which eye, not which side of
+        // the screen plane the element is on.
+        const float ndcLimit = (hudOffset > 0.0f) ? StereoBehindNdcLimit : StereoPopOutNdcLimit;
+        return std::max(-ndcLimit, std::min(ndcLimit, ndcOffset));
+    }
+
+    float stereoHudOrthoNdcOffset(uint32_t hudDepthSlider, uint32_t separationSlider) {
+        return stereoHudNdcOffset(hudDepthSlider, separationSlider, true);
     }
 
     // Apply a constant per-eye horizontal shift to a HUD/UI projection matrix so
@@ -122,54 +270,67 @@ namespace RT64 {
     // hudDepthSlider 0..100: 50 = screen plane (no shift), below = push behind
     // the screen (positive parallax), above = pop out (negative parallax).
     //
+    // dynamic3d 5.2: a layer parked at a fixed multiple of the convergence
+    // distance has a shift of separation * (1/factor - 1) - proportional to
+    // separation, and independent of convergence. Scaling by separation is what
+    // makes HUD depth track the depth knob. The per-projection-type constants
+    // below are that (1/factor - 1) mapping; they keep their empirically tuned
+    // values, so at the default separation the relative depths of the HUD and
+    // the world are unchanged.
+    //
     // Perspective and orthographic projections need different elements:
-    //   - Perspective: m[2][0] gets the principal-point offset, scaled by m[0][0].
-    //     After the perspective divide this becomes a constant NDC shift.
+    //   - Perspective: m[2][0] gets the principal-point offset, scaled by the
+    //     REFERENCE projection term rather than the live one so the depth holds
+    //     across aspect ratios. After the perspective divide this becomes a
+    //     constant NDC shift.
     //   - Orthographic: there is no perspective divide, so we add a direct NDC
-    //     shift via m[3][0].
-    static void applyStereoHudShift(interop::float4x4 &projMatrix, StereoEye eye, uint32_t hudDepthSlider, bool isOrthographic) {
+    //     shift via m[3][0], with the sign flipped so the slider pushes both
+    //     projection types the same way.
+    static void applyStereoHudShift(interop::float4x4 &projMatrix, StereoEye eye, uint32_t hudDepthSlider,
+                                    uint32_t separationSlider, bool isOrthographic) {
         if (eye == StereoEye::None) {
             return;
         }
-        const float centered = (static_cast<float>(hudDepthSlider) - 50.0f) / 50.0f; // -1..+1
-        constexpr float maxHudOffset = 0.04f;
-        // Negate so slider > 50 produces pop-out (negative parallax) and
-        // slider < 50 produces push-back (positive parallax).
-        const float hudOffset = -centered * maxHudOffset;
         const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
         if (isOrthographic) {
-            // Match the visible magnitude of the perspective HUD shift so an
-            // ortho HUD and perspective HUD at the same slider value land at
-            // approximately the same depth.
-            constexpr float perspectiveToOrthoScale = 2.75f;
-            projMatrix[3][0] -= eyeSign * hudOffset * perspectiveToOrthoScale;
+            projMatrix[3][0] -= eyeSign * stereoHudOrthoNdcOffset(hudDepthSlider, separationSlider);
         }
         else {
-            projMatrix[2][0] += eyeSign * hudOffset * projMatrix[0][0];
+            projMatrix[2][0] += eyeSign * stereoHudNdcOffset(hudDepthSlider, separationSlider, false);
         }
     }
 
-    // Translate the camera laterally along its local right axis (view space +X)
-    // by ±separationWorld/2. Combined with applyStereoOffAxis, this produces
-    // depth-dependent parallax: objects at convergenceWorld have zero parallax,
-    // closer objects pop out, farther objects push back.
-    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceSlider) {
+    // Translate the camera laterally along its local right axis (view space +X).
+    // Combined with applyStereoOffAxis, this produces depth-dependent parallax:
+    // objects at the convergence distance have zero parallax, closer objects pop
+    // out, farther objects push back.
+    //
+    // dynamic3d 1.1: under clip-space separation the eye baseline is DERIVED per
+    // frame rather than stored, and it moves with BOTH the FoV and the
+    // convergence distance - 2 * separation * tan(half horizontal FoV) * conv
+    // for the pair. That is what pins zero parallax at the convergence distance
+    // while background disparity stays fixed at `separation`. Anything that
+    // wants a physical eye offset has to read it from here rather than assuming
+    // the separation slider is one.
+    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider,
+                                     float convergenceWorld, float projectionScale) {
         if (eye == StereoEye::None) {
             return;
         }
-        float separationWorld;
-        float convergenceWorld;
-        stereoWorldUnits(separationSlider, convergenceSlider, separationWorld, convergenceWorld);
-        // Match the clamp applied to the projection shift so the view and
-        // projection stay geometrically consistent at extreme slider settings.
-        const float separationCap = 0.16f * convergenceWorld;
-        const float effectiveSeparation = (separationWorld > separationCap) ? separationCap : separationWorld;
+        // projectionScale is the live m[0][0] after the widescreen adjust; its
+        // reciprocal is tan(half horizontal FoV). Guard against a degenerate
+        // projection rather than dividing by ~0.
+        if (projectionScale <= 1e-6f) {
+            return;
+        }
+        const float tanHalfHorFov = 1.0f / projectionScale;
+        const float halfBaseline = stereoSeparationFraction(separationSlider) * tanHalfHorFov * convergenceWorld;
         const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
         // For a row-vector view matrix, m[3][0] is the X translation in view
         // space. Adding to it shifts world points right in view space, which is
-        // equivalent to the camera moving left in world space — what we want for
+        // equivalent to the camera moving left in world space - what we want for
         // the Left eye. Right eye gets the opposite sign.
-        viewMatrix[3][0] += eyeSign * (effectiveSeparation * 0.5f);
+        viewMatrix[3][0] += eyeSign * halfBaseline;
     }
 
     // ProjectionProcessor
@@ -276,7 +437,35 @@ namespace RT64 {
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
                 isStereoProjectionId(curProjGroup.matrixId)) {
-                applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
+                applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation);
+
+                // Publish this projection's depth terms for the depth sampler.
+                // The world projection is the one the sampled depth buffer was
+                // rendered with, so these are the right terms to invert it.
+                //
+                // Goemon never emits an explicit world tag - everything untagged
+                // is treated as gameplay (see isStereoProjectionId) - so "which
+                // perspective is the world one" has to come from somewhere else
+                // here. Requiring it to span the framebuffer's full width picks
+                // the same pass the depth sampler's own main-pass test picks; a
+                // small auxiliary perspective with a different near/far would
+                // otherwise be the last to publish and the sampler would invert
+                // its depths with the wrong projection.
+                const bool spansFullWidth = (proj.scissorRect.ulx <= fbPair.scissorRect.ulx) &&
+                    (proj.scissorRect.lrx >= fbPair.scissorRect.lrx);
+                if (spansFullWidth && isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
+                    // The viewport's depth scale/translate is the second layer
+                    // between ndc.z and the stored depth - see
+                    // stereoDeviceDepthToViewZ for why assuming 0.5 is wrong.
+                    float vpScaleZ = 0.0f;
+                    float vpTranslateZ = 0.0f;
+                    if (proj.usesViewport()) {
+                        const interop::RSPViewport &depthViewport = drawData.rspViewports[proj.transformsIndex];
+                        vpScaleZ = depthViewport.scale[2];
+                        vpTranslateZ = depthViewport.translate[2];
+                    }
+                    stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2], vpScaleZ, vpTranslateZ);
+                }
             }
 
             // Apply HUD depth shift to HUD/dialog/cutscene-overlay projections so
@@ -292,7 +481,7 @@ namespace RT64 {
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                     isHudProjection &&
                     (p.stereoHudDepth != 50)) {
-                    applyStereoHudShift(projMatrix, p.stereoEye, p.stereoHudDepth, isOrtho);
+                    applyStereoHudShift(projMatrix, p.stereoEye, p.stereoHudDepth, p.stereoSeparation, isOrtho);
                 }
             }
 
@@ -311,7 +500,7 @@ namespace RT64 {
                 if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                     (proj.type == Projection::Type::Perspective) &&
                     isStereoProjectionId(curProjGroup.matrixId)) {
-                    applyStereoOffAxis(adjustedPrevProj, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
+                    applyStereoOffAxis(adjustedPrevProj, p.stereoEye, p.stereoSeparation);
                 }
                 {
                     const bool isOrtho = (proj.type == Projection::Type::Orthographic);
@@ -320,7 +509,7 @@ namespace RT64 {
                     if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                         isHudProjection &&
                         (p.stereoHudDepth != 50)) {
-                        applyStereoHudShift(adjustedPrevProj, p.stereoEye, p.stereoHudDepth, isOrtho);
+                        applyStereoHudShift(adjustedPrevProj, p.stereoEye, p.stereoHudDepth, p.stereoSeparation, isOrtho);
                     }
                 }
                 viewMatrix = rigidBody->lerp(p.curFrameWeight, *prevViewMatrix, curViewTransform, true);
@@ -357,8 +546,14 @@ namespace RT64 {
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
                 isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
-                applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
-                applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, p.stereoConvergence);
+                // m[0][0] is the post-widescreen-adjust horizontal projection
+                // scale for this same transform index, and the shear above left
+                // it untouched, so it is still the live tan(half FoV) reciprocal
+                // the derived eye baseline needs.
+                const float projectionScale = projMatrix[0][0];
+                const float convergenceWorld = stereoEffectiveConvergence(p.stereoConvergence, p.stereoConvergenceAuto);
+                applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
+                applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
             }
 
             viewProjMatrix = hlslpp::mul(viewMatrix, projMatrix);

@@ -387,6 +387,7 @@ set (SOURCES
     "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_stereo_depth_sampler.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_stereo_renderer.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_leiasr_weaver.cpp"
 

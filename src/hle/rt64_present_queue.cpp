@@ -441,6 +441,13 @@ namespace RT64 {
                         const float resScaleY = static_cast<float>(resScale.y);
                         stereoParams.aspectRatioScale = (resScaleY > 1e-6f) ? (resScaleX / resScaleY) : 1.0f;
 
+                        // Ghost reduction. Sliders are percentages; the shader
+                        // wants a contrast multiplier and a black floor in
+                        // [0,1]. 100 / 0 are the exact no-ops.
+                        const auto &stereoCfg = ext.sharedResources->userConfig;
+                        stereoParams.ghostContrast = float(stereoCfg.stereoGhostContrast) / 100.0f;
+                        stereoParams.ghostBlackFloor = float(stereoCfg.stereoGhostBlackFloor) / 100.0f;
+
 #                   ifdef LEIASR_SUPPORTED
                         // LeiaSR weaving requires D3D12 and the SR Platform
                         // service. When all of that is in place: compose SbS
@@ -622,6 +629,12 @@ namespace RT64 {
                         overlayParams.vi = &present.screenVI;
                         overlayParams.removeBlackBorders = removeBlackBorders;
                         overlayParams.isUIOverlay = true;
+                        // Same coefficients as the world pass: the remap is
+                        // affine, so remapping both layers is identical to
+                        // remapping the blended result once, and the UI is the
+                        // high-contrast content that ghosts worst.
+                        overlayParams.ghostContrast = float(ext.sharedResources->userConfig.stereoGhostContrast) / 100.0f;
+                        overlayParams.ghostBlackFloor = float(ext.sharedResources->userConfig.stereoGhostBlackFloor) / 100.0f;
                         stereoRenderer->render(overlayParams);
                     }
                     else {

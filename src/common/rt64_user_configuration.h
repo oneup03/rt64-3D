@@ -115,13 +115,51 @@ namespace RT64 {
         bool idleWorkActive;
         bool developerMode;
         StereoMode stereoMode;
-        // Slider value 0..100 set from the host application; converted to
-        // world-space units by the renderer.
+        // Slider values set from the host application.
+        //   stereoSeparation: 0..50, the CLIP-SPACE separation. Each point is
+        //     0.2% of screen width of background disparity, so the full range
+        //     is 0..0.10 - roughly up to the divergence ceiling on a 27-inch
+        //     16:9 monitor.
+        //   stereoConvergence: 1..200, the zero-parallax distance directly in
+        //     game units. Under clip space this no longer affects background
+        //     disparity at all; it only moves what sits in front of the screen.
         uint32_t stereoSeparation;
         uint32_t stereoConvergence;
         // HUD/textbox depth slider. 50 = screen plane (mono). Below 50 the HUD
         // is pushed behind the screen; above 50 it pops out toward the viewer.
         uint32_t stereoHudDepth;
+        // Ghost-reduction (anti-crosstalk) range compression applied by the
+        // stereo compose shader. Every stereo display leaks part of each eye's
+        // image into the other, and how visible that leak is depends on the
+        // brightness difference between the eyes, so compressing the range
+        // before the image reaches the display reduces what is visible.
+        //   stereoGhostContrast:   0..100 percent. 100 = off (no squeeze).
+        //   stereoGhostBlackFloor: 0..100 percent. 0 = off (no lift).
+        // Both are exact no-ops at their defaults and the shader skips the
+        // math entirely when they are both there.
+        uint32_t stereoGhostContrast;
+        uint32_t stereoGhostBlackFloor;
+        // Non-zero while the user's Auto Convergence toggle is on. Gates the
+        // depth-driven convergence loop in the workload queue.
+        uint32_t stereoAutoConvergence;
+        // The user's convergence slider as configured, before the depth loop
+        // pulls it in. The loop needs this as its CEILING - it only ever moves
+        // the screen plane closer, never further, so the slider still does what
+        // the user expects.
+        uint32_t stereoConvergenceManual;
+        // Comfort budget for the depth-driven convergence loop, in thousandths
+        // of screen width of permitted pop-out. SIGNED: 0 puts the screen plane
+        // exactly on the nearest object, and negative values pull it in FRONT
+        // of the nearest object so the whole scene sits behind the screen - the
+        // most conservative stereo there is, and what some viewers prefer.
+        int32_t stereoComfortTarget;
+        // Set while the game reports the current scene as one that frames
+        // things close - FMVs, file select, minigames, first-person views. The
+        // depth loop tightens its comfort budget here rather than being
+        // replaced by it: those scenes cut hard, and the loop's smoothing needs
+        // several frames to settle after each cut, which is exactly when a
+        // close framing reads worst.
+        uint32_t stereoSceneLowConvergence;
 
         UserConfiguration();
         void validate();
