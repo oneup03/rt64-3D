@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "../include/rt64_extended_gbi.h"
@@ -203,6 +204,15 @@ namespace RT64 {
     // the window shape and any in-game FoV change.
     static constexpr float ReferenceProjectionScale = 0.975f;
 
+    // TEMPORARY convergence investigation: per process() call, how many
+    // perspective projections drew, how many received the view shift (the only
+    // place convergence acts), and the convergence they got.
+    static uint32_t debugPerspectiveCount = 0;
+    static uint32_t debugViewShiftCount = 0;
+    static uint32_t debugOtherIdCount = 0;
+    static uint32_t debugLastOtherId = 0;
+    static float debugLastConvergence = 0.0f;
+
     // dynamic3d 1.1 - the shear is the knob.
     //
     // The old cap on the shear term is gone along with the world-units form. It
@@ -346,6 +356,37 @@ namespace RT64 {
     }
 
     void ProjectionProcessor::process(const ProcessParams &p) {
+        // The frame's main world projection: of the full-width world
+        // perspectives, the one with the most draw calls. Goemon also draws
+        // other full-width perspectives - 3D HUD items, at much narrower FoVs -
+        // and scenes are not processed in draw order, so neither the first nor
+        // the last one seen is reliably the world. Taking the first was measured
+        // picking a HUD projection nearly every frame, which handed the depth
+        // sampler the wrong projection to invert and broke auto-convergence.
+        primaryWorld = nullptr;
+        uint32_t primaryWorldCalls = 0;
+        for (const GameScene &scene : p.curFrame->perspectiveScenes) {
+            for (const GameIndices::Projection &sceneProj : scene.projections) {
+                const Workload &workload = p.workloadQueue->workloads[sceneProj.workloadIndex];
+                const FramebufferPair &fbPair = workload.fbPairs[sceneProj.fbPairIndex];
+                const Projection &proj = fbPair.projections[sceneProj.projectionIndex];
+                if ((proj.type != Projection::Type::Perspective) || proj.scissorRect.isNull()) {
+                    continue;
+                }
+
+                const uint32_t groupIndex = workload.drawData.viewProjTransformGroups[proj.transformsIndex];
+                const uint32_t matrixId = workload.drawData.transformGroups[groupIndex].matrixId;
+                const bool spansFullWidth = (proj.scissorRect.ulx <= fbPair.scissorRect.ulx) &&
+                    (proj.scissorRect.lrx >= fbPair.scissorRect.lrx);
+                if (spansFullWidth && isStereoViewShiftProjectionId(matrixId) && (proj.gameCallCount > primaryWorldCalls)) {
+                    primaryWorld = &proj;
+                    primaryWorldCalls = proj.gameCallCount;
+                }
+            }
+        }
+
+        skyInterpolationAngle = 0.0f;
+        skyProjScaleX = 0.0f;
         for (uint32_t w : p.curFrame->workloads) {
             Workload &workload = p.workloadQueue->workloads[w];
             DrawData &drawData = workload.drawData;
@@ -359,12 +400,29 @@ namespace RT64 {
             drawData.prevViewProjTransforms = drawData.viewProjTransforms;
         }
 
+        debugPerspectiveCount = 0;
+        debugViewShiftCount = 0;
+        debugOtherIdCount = 0;
+        debugLastOtherId = 0;
+        debugLastConvergence = 0.0f;
+
         for (size_t s = 0; s < p.curFrame->perspectiveScenes.size(); s++) {
             processScene(p, p.curFrame->perspectiveScenes[s], s);
         }
 
         for (size_t s = 0; s < p.curFrame->orthographicScenes.size(); s++) {
             processScene(p, p.curFrame->orthographicScenes[s], s);
+        }
+
+        if (p.stereoEye == StereoEye::Left) {
+            static uint32_t convergenceLogCounter = 0;
+            if ((convergenceLogCounter++ % 30) == 0) {
+                fprintf(stdout, "RT64CONV persp=%u viewshift=%u otherIds=%u lastOtherId=%08X conv=%.2f slider=%u auto=%.2f primaryCalls=%u\n",
+                    debugPerspectiveCount, debugViewShiftCount, debugOtherIdCount, debugLastOtherId, debugLastConvergence,
+                    p.stereoConvergence, p.stereoConvergenceAuto,
+                    (primaryWorld != nullptr) ? primaryWorld->gameCallCount : 0u);
+                fflush(stdout);
+            }
         }
     }
 
@@ -432,6 +490,16 @@ namespace RT64 {
 
             adjustProjectionMatrix(projMatrix, projRatioScale);
 
+            // See process(): picked by draw count, not by processing order.
+            const bool isPrimaryWorld = (&proj == primaryWorld);
+            if (proj.type == Projection::Type::Perspective) {
+                debugPerspectiveCount++;
+                if (!isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
+                    debugOtherIdCount++;
+                    debugLastOtherId = curProjGroup.matrixId;
+                }
+            }
+
             // Apply stereoscopic off-axis projection offset for world (gameplay)
             // and skybox projections.
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
@@ -444,16 +512,11 @@ namespace RT64 {
                 // rendered with, so these are the right terms to invert it.
                 //
                 // Goemon never emits an explicit world tag - everything untagged
-                // is treated as gameplay (see isStereoProjectionId) - so "which
-                // perspective is the world one" has to come from somewhere else
-                // here. Requiring it to span the framebuffer's full width picks
-                // the same pass the depth sampler's own main-pass test picks; a
-                // small auxiliary perspective with a different near/far would
-                // otherwise be the last to publish and the sampler would invert
-                // its depths with the wrong projection.
-                const bool spansFullWidth = (proj.scissorRect.ulx <= fbPair.scissorRect.ulx) &&
-                    (proj.scissorRect.lrx >= fbPair.scissorRect.lrx);
-                if (spansFullWidth && isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
+                // is treated as gameplay (see isStereoProjectionId) - so the
+                // world is identified as the first full-width perspective (see
+                // isPrimaryWorld). Requiring full width picks the same pass the
+                // depth sampler's own main-pass test picks.
+                if (isPrimaryWorld) {
                     // The viewport's depth scale/translate is the second layer
                     // between ndc.z and the stored depth - see
                     // stereoDeviceDepthToViewZ for why assuming 0.5 is wrong.
@@ -465,6 +528,16 @@ namespace RT64 {
                         vpTranslateZ = depthViewport.translate[2];
                     }
                     stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2], vpScaleZ, vpTranslateZ);
+
+                    // TEMPORARY sky-scroll investigation: the live horizontal
+                    // and vertical scales of the world projection.
+                    static uint32_t worldLogCounter = 0;
+                    if ((worldLogCounter++ % 97) == 0) {
+                        fprintf(stdout, "RT64WORLD m00=%.5f m11=%.5f m20=%.5f projRatioScale=%.4f aspectRatioScale=%.4f eye=%d id=%08X\n",
+                            float(projMatrix[0][0]), float(projMatrix[1][1]), float(projMatrix[2][0]), projRatioScale, p.aspectRatioScale,
+                            int(p.stereoEye), curProjGroup.matrixId);
+                        fflush(stdout);
+                    }
                 }
             }
 
@@ -552,8 +625,38 @@ namespace RT64 {
                 // the derived eye baseline needs.
                 const float projectionScale = projMatrix[0][0];
                 const float convergenceWorld = stereoEffectiveConvergence(p.stereoConvergence, p.stereoConvergenceAuto);
+                debugViewShiftCount++;
+                debugLastConvergence = convergenceWorld;
                 applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
                 applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
+            }
+
+            // The bearing, in the INTERPOLATED view, of the direction straight
+            // ahead of the CURRENT camera: how far a camera-tracking sky has to
+            // be rotated on this frame, since the game positioned it for the
+            // current heading. Rotation only - the stereo view shift is a
+            // translation and has no effect at infinity - and the projection
+            // shear is the same offset at infinity either way.
+            //
+            // Row vectors: v_view = v_world * V. The view's rotation is
+            // orthonormal up to a uniform scale, so its transpose inverts it up
+            // to a scale that cancels in the ratio below: the current camera's
+            // forward (view -Z) in world space is -column 2 of the current V.
+            if (isPrimaryWorld) {
+                const interop::float4x4 &curView = drawData.viewTransforms[proj.transformsIndex];
+                float vx = 0.0f;
+                float vz = 0.0f;
+                for (int i = 0; i < 3; i++) {
+                    const float forward = -float(curView[i][2]);
+                    vx += forward * float(viewMatrix[i][0]);
+                    vz += forward * float(viewMatrix[i][2]);
+                }
+                // vz < 0 is in front; a point behind the interpolated camera
+                // means a degenerate cut, not a turn.
+                if (vz < -1e-6f) {
+                    skyInterpolationAngle = std::atan2(vx, -vz);
+                }
+                skyProjScaleX = float(projMatrix[0][0]);
             }
 
             viewProjMatrix = hlslpp::mul(viewMatrix, projMatrix);

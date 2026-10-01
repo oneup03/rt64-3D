@@ -202,7 +202,10 @@ namespace RT64 {
         // positive parallax instead of the HUD-depth shift. Cleared by
         // setSkyboxRect(false) — the recomp patch wraps the background-draw
         // dispatcher in matched on/off calls.
-        void setSkyboxRect(bool on);
+        //   mode bit 0: a background at infinity.
+        //   mode bit 1: its scroll follows the camera heading (see
+        //               DrawExtendedFlags::skyboxTracksCamera).
+        void setSkyboxRect(uint8_t mode);
         void clearExtended();
 
         // The expected size and order for the elements in each array are:
