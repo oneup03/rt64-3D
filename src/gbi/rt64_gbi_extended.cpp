@@ -185,8 +185,8 @@ namespace RT64 {
         }
 
         void setSkyboxRectV1(State *state, DisplayList **dl) {
-            const uint8_t mode = (*dl)->p1(0, 2);
-            state->rdp->setSkyboxRect(mode);
+            const uint8_t on = (*dl)->p1(0, 1);
+            state->rdp->setSkyboxRect(on != 0);
         }
         
         void forceBranchV1(State *state, DisplayList **dl) {

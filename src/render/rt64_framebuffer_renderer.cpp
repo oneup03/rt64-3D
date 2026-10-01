@@ -17,11 +17,6 @@
 #include "rt64_projection_processor.h"
 #include "rt64_render_worker.h"
 
-#include <cstdio>
-
-// TEMPORARY sky-scroll investigation: log how sky rects are placed on screen.
-#define RT64_SKY_SCROLL_DEBUG 1
-
 // TODO: Move to shared.
 
 namespace interop {
@@ -1717,60 +1712,7 @@ namespace RT64 {
                             // doesn't propagate to them — we use the per-rect
                             // extendedFlags bit instead, which IS captured on
                             // every drawCall via loadDrawState.
-#if RT64_SKY_SCROLL_DEBUG
-                            if (call.callDesc.extendedFlags.skyboxRect) {
-                                static uint32_t skyLogCounter = 0;
-                                if ((skyLogCounter++ % 97) == 0) {
-                                    // rect is fixed point (x4) in the game's 320 space.
-                                    const float rectUnits = float(call.callDesc.rect.lrx - call.callDesc.rect.ulx) / 4.0f;
-                                    fprintf(stdout, "RT64SKY rect=%d,%d..%d,%d units=%.2f vp.x=%.2f vp.w=%.2f fb.vp.w=%.2f fbWidth=%d invRatio=%.4f aspectScale=%.4f covers=%d merged=%d tileCopies=%d scissor=%d..%d off=%.5f track=%d interp=%.5f ndcPerUnit=%.6f\n",
-                                        call.callDesc.rect.ulx, call.callDesc.rect.uly, call.callDesc.rect.lrx, call.callDesc.rect.lry,
-                                        rectUnits, viewportRect.x, viewportRect.width, framebuffer.viewport.width, int(p.fbWidth),
-                                        invRatioScale, aspectRatioScale, int(coversScissorWidth), int(coversScissorWidthMerged), int(tileCopiesUsed),
-                                        fbPair.scissorRect.ulx, fbPair.scissorRect.lrx, p.stereoSkyboxRectOffsetX,
-                                        int(call.callDesc.extendedFlags.skyboxTracksCamera), p.skyInterpolationAngle,
-                                        (rectUnits > 0.0f) ? ((2.0f * viewportRect.width / framebuffer.viewport.width) / rectUnits) : 0.0f);
-                                    fflush(stdout);
-                                }
-                            }
-#endif
-                            const bool skyTracksCamera = call.callDesc.extendedFlags.skyboxRect && call.callDesc.extendedFlags.skyboxTracksCamera;
-                            if (skyTracksCamera) {
-                                // A camera-tracking sky is drawn by the patch as
-                                // a cylinder at infinity: narrow vertical slices,
-                                // each sampling the panorama at the bearing its
-                                // screen position has, and extended past both
-                                // edges far enough for the rotation and stereo
-                                // shift below. So it needs no cover zoom.
-                                //
-                                // On an interpolated frame it is rotated to the
-                                // interpolated heading. A point at screen x is
-                                // at bearing atan(x / m00), so rotating by delta
-                                // moves it to f(x) = m00 * tan(atan(x / m00) +
-                                // delta) - faster towards the edges, exactly as
-                                // the world moves. Each slice's two EDGES are
-                                // mapped through f rather than its centre being
-                                // shifted, so neighbouring slices keep sharing
-                                // an edge instead of opening seams.
-                                const float m00 = p.skyProjScaleX;
-                                const float delta = std::max(-SkyInterpolationAngleLimit,
-                                    std::min(SkyInterpolationAngleLimit, p.skyInterpolationAngle));
-                                if ((m00 > 1e-4f) && (delta != 0.0f)) {
-                                    const float centre = triangles.screenOffset.x - halfPixelOffset.x;
-                                    const float halfWidth = triangles.screenScale.x;
-                                    auto rotate = [m00, delta](float x) {
-                                        const float bearing = std::atan(x / m00) + delta;
-                                        const float limit = 1.55f;
-                                        return m00 * std::tan(std::max(-limit, std::min(limit, bearing)));
-                                    };
-                                    const float left = rotate(centre - halfWidth);
-                                    const float right = rotate(centre + halfWidth);
-                                    triangles.screenOffset.x = halfPixelOffset.x + (left + right) * 0.5f;
-                                    triangles.screenScale.x = (right - left) * 0.5f;
-                                }
-                                triangles.screenOffset.x += p.stereoSkyboxRectOffsetX;
-                            }
-                            else if (call.callDesc.extendedFlags.skyboxRect && (p.stereoSkyboxRectOffsetX != 0.0f)) {
+                            if (call.callDesc.extendedFlags.skyboxRect && (p.stereoSkyboxRectOffsetX != 0.0f)) {
                                 // Cover zoom (dynamic3d 5.2). Shifting the
                                 // background by the at-infinity offset uncovers
                                 // a strip at one edge of each eye, and there is
@@ -1788,9 +1730,6 @@ namespace RT64 {
                                 // pivot scales the assembled image as one.
                                 // Uniform in both axes so the sky keeps its
                                 // aspect; the extra height is simply clipped.
-                                //
-                                // Static backdrops only: a camera-tracking sky
-                                // is drawn with an overhang instead (above).
                                 const float coverScale = 1.0f + std::abs(p.stereoSkyboxRectOffsetX);
                                 triangles.screenScale.x *= coverScale;
                                 triangles.screenScale.y *= coverScale;

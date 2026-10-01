@@ -35,15 +35,6 @@ namespace RT64 {
     static constexpr float StereoBehindNdcLimit = 0.10f;   // ~5% of eye width
     static constexpr float StereoPopOutNdcLimit = 0.30f;   // ~15% of eye width
 
-    // Largest interpolation rotation applied to a camera-tracking sky, in
-    // radians (see DrawExtendedFlags::skyboxTracksCamera): a full game frame of
-    // turning at ~6.9 degrees per frame, against a measured 2.9 degree median
-    // and 6.6 maximum. The patch draws such a sky wide enough past each edge to
-    // cover this rotation at the live FoV (plus the stereo shift), so it
-    // reveals real sky rather than an edge and needs no cover zoom, unlike a
-    // static backdrop.
-    static constexpr float SkyInterpolationAngleLimit = 0.12f;
-
     // The clip-space separation for a slider value: the per-eye NDC x offset of
     // content at infinity, and half the total background disparity as a
     // fraction of screen width.
@@ -127,15 +118,9 @@ namespace RT64 {
             uint32_t stereoHudDepth = 50;
         };
 
-        // Per process() call: the frame's main world projection, the angle by which the INTERPOLATED view lags the CURRENT
-        // camera's heading (the bearing of the current forward direction in the
-        // interpolated view, positive to the right; zero on a non-interpolated
-        // frame), and the world projection's horizontal scale m[0][0]. The
-        // workload queue hands both to the framebuffer renderer, which rotates
-        // camera-tracking skies by the angle.
+        // Per process() call: the frame's main world projection - the
+        // full-width world perspective with the most draw calls.
         const Projection *primaryWorld = nullptr;
-        float skyInterpolationAngle = 0.0f;
-        float skyProjScaleX = 0.0f;
 
         ProjectionProcessor();
         ~ProjectionProcessor();

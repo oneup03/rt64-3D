@@ -361,17 +361,10 @@ typedef union {
         PARAM(force, 1, 0) \
     )
 
-// mode: 0 = off, G_EX_SKYBOX_RECT_STATIC = a background at infinity,
-// G_EX_SKYBOX_RECT_TRACKING = a background at infinity whose scroll follows the
-// camera's heading. Only the latter is shifted on interpolated frames to follow
-// the interpolated view - a static backdrop would jitter if it were.
-#define G_EX_SKYBOX_RECT_STATIC     1
-#define G_EX_SKYBOX_RECT_TRACKING   3
-
-#define gEXSetSkyboxRect(cmd, mode) \
+#define gEXSetSkyboxRect(cmd, on) \
     G_EX_COMMAND1(cmd, \
         PARAM(RT64_EXTENDED_OPCODE, 8, 24) | PARAM(G_EX_SETSKYBOXRECT_V1, 24, 0), \
-        PARAM(mode, 2, 0) \
+        PARAM(on, 1, 0) \
     )
 
 #define gEXForceBranch(cmd, force) \

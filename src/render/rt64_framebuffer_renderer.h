@@ -159,11 +159,6 @@ namespace RT64 {
             // applyStereoOffAxis at the far plane, so 2D background images
             // appear infinitely far away rather than at HUD depth.
             float stereoSkyboxRectOffsetX = 0.0f;
-            // How far the interpolated view lags the heading the game drew a
-            // camera-tracking sky for, in radians, and the world projection's
-            // m[0][0] to rotate it with. See DrawExtendedFlags::skyboxTracksCamera.
-            float skyInterpolationAngle = 0.0f;
-            float skyProjScaleX = 0.0f;
         };
 
         FramebufferRenderer(RenderWorker *worker, bool rtSupport, UserConfiguration::GraphicsAPI graphicsAPI, const ShaderLibrary *shaderLibrary);

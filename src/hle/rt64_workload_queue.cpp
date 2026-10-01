@@ -725,10 +725,6 @@ namespace RT64 {
                     // visible depth as ortho-projected UI.
                     drawParams.stereoRectOffsetX = 0.0f;
                     drawParams.stereoSkyboxRectOffsetX = 0.0f;
-                    // Not stereo-specific: interpolated frames draw the world
-                    // from an interpolated view in mono too.
-                    drawParams.skyInterpolationAngle = processProjections ? projectionProcessor.skyInterpolationAngle : 0.0f;
-                    drawParams.skyProjScaleX = processProjections ? projectionProcessor.skyProjScaleX : 0.0f;
                     if ((stereoMode != UserConfiguration::StereoMode::Off) &&
                         (stereoEye != StereoEye::None)) {
                         const float eyeSign = (stereoEye == StereoEye::Left) ? +1.0f : -1.0f;
@@ -1018,21 +1014,6 @@ namespace RT64 {
                                     const float applied = stereoAutoConvergence.update(nearestZ, cfg.stereoConvergenceManual,
                                         cfg.stereoSeparation, cfg.stereoComfortTarget, cfg.stereoSceneLowConvergence != 0);
                                     stereoStoreAutoConvergence(applied);
-
-                                    // TEMPORARY convergence investigation: every
-                                    // input and output of the loop, so a shot that
-                                    // loses its depth can be traced to the depth it
-                                    // measured, the projection it inverted with, or
-                                    // the solve itself.
-                                    static uint32_t autoConvergenceLogCounter = 0;
-                                    if ((autoConvergenceLogCounter++ % 15) == 0) {
-                                        fprintf(stdout, "RT64AUTOCONV device=%.6f nearZ=%.2f zEma=%.2f applied=%.2f manual=%u comfort=%d low=%u sep=%u m22=%.5f m32=%.4f vpZ=%.5f,%.5f primaryCalls=%u\n",
-                                            sample.nearestDeviceDepth, nearestZ, stereoAutoConvergence.zEma, applied, cfg.stereoConvergenceManual,
-                                            cfg.stereoComfortTarget, cfg.stereoSceneLowConvergence, cfg.stereoSeparation,
-                                            projM22, projM32, vpScaleZ, vpTranslateZ,
-                                            (projectionProcessor.primaryWorld != nullptr) ? projectionProcessor.primaryWorld->gameCallCount : 0u);
-                                        fflush(stdout);
-                                    }
                                 }
                             }
                         }

@@ -1078,9 +1078,8 @@ namespace RT64 {
         state->updateDrawStatusAttribute(DrawAttribute::ExtendedFlags);
     }
 
-    void RDP::setSkyboxRect(uint8_t mode) {
-        extended.drawExtendedFlags.skyboxRect = (mode & 0x1) ? 1 : 0;
-        extended.drawExtendedFlags.skyboxTracksCamera = (mode & 0x2) ? 1 : 0;
+    void RDP::setSkyboxRect(bool on) {
+        extended.drawExtendedFlags.skyboxRect = on;
         state->updateDrawStatusAttribute(DrawAttribute::ExtendedFlags);
     }
 

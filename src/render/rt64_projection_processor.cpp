@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 
 #include "../include/rt64_extended_gbi.h"
@@ -183,16 +182,6 @@ namespace RT64 {
         const float manual = stereoConvergenceWorld(convergenceSlider);
         return (convergenceAuto > 0.0f) ? std::min(convergenceAuto, manual) : manual;
     }
-
-    // TEMPORARY convergence investigation: per process() call, how many
-    // perspective projections drew, how many received the view shift (the only
-    // place convergence acts), and the convergence they got.
-    static uint32_t debugPerspectiveCount = 0;
-    static uint32_t debugViewShiftCount = 0;
-    static uint32_t debugOtherIdCount = 0;
-    static uint32_t debugLastOtherId = 0;
-    static uint32_t debugHudCameraCount = 0;
-    static float debugLastConvergence = 0.0f;
 
     // dynamic3d 1.1 - the shear is the knob.
     //
@@ -411,8 +400,6 @@ namespace RT64 {
             }
         }
 
-        skyInterpolationAngle = 0.0f;
-        skyProjScaleX = 0.0f;
         for (uint32_t w : p.curFrame->workloads) {
             Workload &workload = p.workloadQueue->workloads[w];
             DrawData &drawData = workload.drawData;
@@ -426,30 +413,12 @@ namespace RT64 {
             drawData.prevViewProjTransforms = drawData.viewProjTransforms;
         }
 
-        debugPerspectiveCount = 0;
-        debugViewShiftCount = 0;
-        debugOtherIdCount = 0;
-        debugLastOtherId = 0;
-        debugHudCameraCount = 0;
-        debugLastConvergence = 0.0f;
-
         for (size_t s = 0; s < p.curFrame->perspectiveScenes.size(); s++) {
             processScene(p, p.curFrame->perspectiveScenes[s], s);
         }
 
         for (size_t s = 0; s < p.curFrame->orthographicScenes.size(); s++) {
             processScene(p, p.curFrame->orthographicScenes[s], s);
-        }
-
-        if (p.stereoEye == StereoEye::Left) {
-            static uint32_t convergenceLogCounter = 0;
-            if ((convergenceLogCounter++ % 30) == 0) {
-                fprintf(stdout, "RT64CONV persp=%u viewshift=%u hudcams=%u otherIds=%u lastOtherId=%08X conv=%.2f slider=%u auto=%.2f primaryCalls=%u\n",
-                    debugPerspectiveCount, debugViewShiftCount, debugHudCameraCount, debugOtherIdCount, debugLastOtherId, debugLastConvergence,
-                    p.stereoConvergence, p.stereoConvergenceAuto,
-                    (primaryWorld != nullptr) ? primaryWorld->gameCallCount : 0u);
-                fflush(stdout);
-            }
         }
     }
 
@@ -529,9 +498,6 @@ namespace RT64 {
             const bool getsWorldShear = (proj.type == Projection::Type::Perspective) &&
                 isStereoProjectionId(curProjGroup.matrixId) && !isHudCamera;
             const bool isOrthoProjection = (proj.type == Projection::Type::Orthographic);
-            if (isHudCamera) {
-                debugHudCameraCount++;
-            }
             // Every orthographic projection is 2D content - the logo tiles,
             // menus and HUD panels - whatever its ID. The world-ID test only
             // means something for perspectives: Goemon tags nothing, so the
@@ -548,13 +514,6 @@ namespace RT64 {
             const float hudNdcOffset = isHudProjection
                 ? stereoSnapNdcToPixel(stereoHudNdcOffset(p.stereoHudDepth, p.stereoSeparation), hudHalfViewport, hudNativePixel)
                 : 0.0f;
-            if (proj.type == Projection::Type::Perspective) {
-                debugPerspectiveCount++;
-                if (!isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
-                    debugOtherIdCount++;
-                    debugLastOtherId = curProjGroup.matrixId;
-                }
-            }
 
             // Apply stereoscopic off-axis projection offset for world (gameplay)
             // and skybox projections.
@@ -582,16 +541,6 @@ namespace RT64 {
                         vpTranslateZ = depthViewport.translate[2];
                     }
                     stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2], vpScaleZ, vpTranslateZ);
-
-                    // TEMPORARY sky-scroll investigation: the live horizontal
-                    // and vertical scales of the world projection.
-                    static uint32_t worldLogCounter = 0;
-                    if ((worldLogCounter++ % 97) == 0) {
-                        fprintf(stdout, "RT64WORLD m00=%.5f m11=%.5f m20=%.5f projRatioScale=%.4f aspectRatioScale=%.4f eye=%d id=%08X\n",
-                            float(projMatrix[0][0]), float(projMatrix[1][1]), float(projMatrix[2][0]), projRatioScale, p.aspectRatioScale,
-                            int(p.stereoEye), curProjGroup.matrixId);
-                        fflush(stdout);
-                    }
                 }
             }
 
@@ -661,38 +610,8 @@ namespace RT64 {
                 // the derived eye baseline needs.
                 const float projectionScale = projMatrix[0][0];
                 const float convergenceWorld = stereoEffectiveConvergence(p.stereoConvergence, p.stereoConvergenceAuto);
-                debugViewShiftCount++;
-                debugLastConvergence = convergenceWorld;
                 applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
                 applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
-            }
-
-            // The bearing, in the INTERPOLATED view, of the direction straight
-            // ahead of the CURRENT camera: how far a camera-tracking sky has to
-            // be rotated on this frame, since the game positioned it for the
-            // current heading. Rotation only - the stereo view shift is a
-            // translation and has no effect at infinity - and the projection
-            // shear is the same offset at infinity either way.
-            //
-            // Row vectors: v_view = v_world * V. The view's rotation is
-            // orthonormal up to a uniform scale, so its transpose inverts it up
-            // to a scale that cancels in the ratio below: the current camera's
-            // forward (view -Z) in world space is -column 2 of the current V.
-            if (isPrimaryWorld) {
-                const interop::float4x4 &curView = drawData.viewTransforms[proj.transformsIndex];
-                float vx = 0.0f;
-                float vz = 0.0f;
-                for (int i = 0; i < 3; i++) {
-                    const float forward = -float(curView[i][2]);
-                    vx += forward * float(viewMatrix[i][0]);
-                    vz += forward * float(viewMatrix[i][2]);
-                }
-                // vz < 0 is in front; a point behind the interpolated camera
-                // means a degenerate cut, not a turn.
-                if (vz < -1e-6f) {
-                    skyInterpolationAngle = std::atan2(vx, -vz);
-                }
-                skyProjScaleX = float(projMatrix[0][0]);
             }
 
             viewProjMatrix = hlslpp::mul(viewMatrix, projMatrix);

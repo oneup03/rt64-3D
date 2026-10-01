@@ -72,13 +72,6 @@ namespace RT64 {
         // Set by RDP::setSkyboxRect via the gEXSetSkyboxRect GBI command,
         // emitted by the patch on Goemon's background-draw dispatcher.
         uint32_t skyboxRect : 1;
-        // The background's scroll follows the camera heading. The game updates
-        // that scroll once per game frame, while RT64 draws the world from an
-        // INTERPOLATED view on frames in between, so without a correction the
-        // sky sits at the newest heading while the world lags behind it - the
-        // sky leads every turn and reads as moving too fast. Rects with this
-        // set are shifted on interpolated frames to the interpolated heading.
-        uint32_t skyboxTracksCamera : 1;
     };
 
     struct DrawCall {
