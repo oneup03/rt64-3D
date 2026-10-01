@@ -13,6 +13,7 @@
 #include "../include/rt64_extended_gbi.h"
 #include "common/rt64_math.h"
 #include "hle/rt64_workload_queue.h"
+#include "rt64_render_target.h"
 
 namespace RT64 {
     // The world projection's two depth terms, published from the render thread
@@ -94,31 +95,29 @@ namespace RT64 {
                (matrixId == G_EX_ID_AUTO);
     }
 
-    // Heuristic skybox detector for untagged (G_EX_ID_AUTO) perspective
-    // projections. A skybox is the only common N64 perspective draw whose
-    // view matrix has near-zero translation — the camera sits at the origin
-    // so the sky cube/sphere appears infinitely far regardless of where the
-    // gameplay camera is. Gameplay projections always have a meaningful
-    // world-space camera position baked into the view's translation column.
+    // Goemon draws some HUD items as small 3D models under a perspective
+    // projection of their own, untagged like the world's, so by ID they would
+    // get the world's stereo (shear plus view shift) and sit in the scene at
+    // whatever depth their private camera puts them. What gives them away is
+    // that camera: a fixed one a few dozen units from the origin, looking
+    // straight down -Z - measured at a translation of (0, 0, -21) with a
+    // rotation within 0.1 degrees of identity, near 1 and far ~1000 - where a
+    // world camera is wherever the scene is, pointed wherever the shot needs.
     //
-    // Threshold chosen to be well below any sensible N64 world-space camera
-    // position (game units, typically hundreds to thousands) but above
-    // floating-point noise from interpolation. If a skybox ever drifts a
-    // tiny bit off origin (e.g. parented to the player's XZ), bump this.
-    //
-    // The check pairs with the existing isStereoProjectionId AUTO fallback:
-    // an untagged perspective gets the off-axis shift unconditionally (so it
-    // still renders in stereo), but the view shift is gated on this
-    // heuristic so skybox-like draws land at infinity instead of getting
-    // pulled to the convergence plane.
-    static bool viewMatrixLooksLikeSkybox(const interop::float4x4 &viewMatrix) {
-        const float tx = static_cast<float>(viewMatrix[3][0]);
-        const float ty = static_cast<float>(viewMatrix[3][1]);
-        const float tz = static_cast<float>(viewMatrix[3][2]);
-        constexpr float kSkyboxTranslationThreshold = 1.0f;   // game units
-        return (std::abs(tx) < kSkyboxTranslationThreshold)
-            && (std::abs(ty) < kSkyboxTranslationThreshold)
-            && (std::abs(tz) < kSkyboxTranslationThreshold);
+    // The caller also requires that the projection is not the frame's main
+    // world projection (the one with the most draw calls), so the world can
+    // never be taken for HUD even if its camera happens to be axis-aligned near
+    // the origin.
+    static bool viewMatrixLooksLikeHudCamera(const interop::float4x4 &viewMatrix) {
+        constexpr float AxisTolerance = 0.01f;           // ~8 degrees off -Z
+        constexpr float MaxCameraDistance = 200.0f;      // game units
+        const float tx = float(viewMatrix[3][0]);
+        const float ty = float(viewMatrix[3][1]);
+        const float tz = float(viewMatrix[3][2]);
+        return (std::abs(float(viewMatrix[0][0]) - 1.0f) < AxisTolerance) &&
+               (std::abs(float(viewMatrix[1][1]) - 1.0f) < AxisTolerance) &&
+               (std::abs(float(viewMatrix[2][2]) - 1.0f) < AxisTolerance) &&
+               ((tx * tx + ty * ty + tz * tz) < (MaxCameraDistance * MaxCameraDistance));
     }
 
     // HUD projections that should receive the user's configured constant
@@ -159,11 +158,8 @@ namespace RT64 {
     // so a value that is comfortable in one is comfortable in the others.
     //
     // The slider-to-fraction constant itself lives in the header as
-    // StereoSeparationPerSlider, alongside StereoHudReferenceSeparation - the
-    // separation the empirical HUD offsets were tuned at (the shipped default,
-    // so the HUD lands at exactly the depth it did before this migration, and
-    // scales with the depth knob away from it) - because the texture-rectangle
-    // path in rt64_workload_queue.cpp has to use the same numbers.
+    // StereoSeparationPerSlider, because the texture-rectangle path in
+    // rt64_workload_queue.cpp has to use the same number.
     float stereoSeparationFraction(uint32_t separationSlider) {
         return static_cast<float>(separationSlider) * StereoSeparationPerSlider;
     }
@@ -188,22 +184,6 @@ namespace RT64 {
         return (convergenceAuto > 0.0f) ? std::min(convergenceAuto, manual) : manual;
     }
 
-    // Goemon's horizontal projection scale at the aspect ratio the HUD
-    // constants below were tuned at (16:9). Used in place of the live m[0][0]
-    // so HUD depth stops tracking the output aspect ratio.
-    //
-    // Derived rather than measured: the shipped skybox-rect code in
-    // rt64_workload_queue.cpp carried 1.3 as Goemon's m[0][0] for the game's
-    // native 4:3 perspective (~60 degree vertical FoV: cot(30) / (4/3) = 1.299).
-    // RT64 then multiplies the projection by projRatioScale = 1/aspectRatioScale
-    // for widescreen, which at 16:9 is (4/3)/(16/9) = 0.75, giving 1.3 * 0.75.
-    // Only the HUD offsets ride on this, so being a few percent off shifts HUD
-    // depth slightly and nothing else; the world path uses the live m[0][0].
-    //
-    // Deliberately frozen: using the live value would make HUD depth track both
-    // the window shape and any in-game FoV change.
-    static constexpr float ReferenceProjectionScale = 0.975f;
-
     // TEMPORARY convergence investigation: per process() call, how many
     // perspective projections drew, how many received the view shift (the only
     // place convergence acts), and the convergence they got.
@@ -211,6 +191,7 @@ namespace RT64 {
     static uint32_t debugViewShiftCount = 0;
     static uint32_t debugOtherIdCount = 0;
     static uint32_t debugLastOtherId = 0;
+    static uint32_t debugHudCameraCount = 0;
     static float debugLastConvergence = 0.0f;
 
     // dynamic3d 1.1 - the shear is the knob.
@@ -231,33 +212,42 @@ namespace RT64 {
     }
 
     // The per-eye NDC x offset for a HUD element at the configured HUD depth,
-    // before the eye sign. Split out of applyStereoHudShift because the
-    // texture-rectangle path in rt64_workload_queue.cpp has to produce exactly
-    // the same number for 2D draws that never pass through a projection matrix.
-    static float stereoHudNdcOffset(uint32_t hudDepthSlider, uint32_t separationSlider, bool isOrthographic) {
+    // before the eye sign. Shared with the texture-rectangle path in
+    // rt64_workload_queue.cpp, which has to produce exactly the same number for
+    // 2D draws that never pass through a projection matrix.
+    //
+    // One offset for every kind of HUD draw. It is an NDC shift either way: on
+    // an orthographic projection m[3][0] += K moves NDC x by K directly, and on
+    // a perspective one m[2][0] += K moves it by K after the divide, at every
+    // depth. The perspective path used to be scaled by a reference projection
+    // term instead (0.975 against 2.75), so a HUD item drawn as a 3D model
+    // moved about a third as far as the text and panels beside it, and the
+    // pieces of one dialog pulled apart in depth.
+    float stereoHudNdcOffset(uint32_t hudDepthSlider, uint32_t separationSlider) {
         const float centered = (static_cast<float>(hudDepthSlider) - 50.0f) / 50.0f; // -1..+1
-        // Negate so slider > 50 produces pop-out (negative parallax) and
-        // slider < 50 produces push-back (positive parallax).
+        // The slider spans exactly the depths a HUD can sensibly take, in units
+        // of the scene's own disparity. At 0 the shift is the full separation -
+        // the depth of infinity, where the sky sits - so the HUD can never be
+        // pushed behind the world's farthest point; at 50 it is on the screen
+        // plane; at 100 it pops out as far as infinity sits behind.
         //
-        // dynamic3d 5.2: a layer parked at a fixed multiple of the convergence
-        // distance has a shift of separation * (1/factor - 1) - proportional to
-        // separation, and independent of convergence. Scaling by separation is
-        // what makes HUD depth track the depth knob, and what makes the HUD go
-        // properly flat when separation is 0 (the old fixed offset split the
-        // HUD even with the 3D effect dialled all the way down).
-        const float separationScale = stereoSeparationFraction(separationSlider) / StereoHudReferenceSeparation;
-        const float hudOffset = -centered * StereoHudMaxOffset * separationScale;
-
-        // Map onto an NDC x offset, per projection type:
-        //   Perspective: m[2][0] += K becomes a constant NDC shift of K after
-        //     the perspective divide. Scaled by the REFERENCE projection term
-        //     rather than the live one so the depth holds across aspect ratios.
-        //   Orthographic: no perspective divide, so m[3][0] += K shifts NDC by
-        //     +K directly, and the caller flips the sign to keep the slider
-        //     pushing both projection types the same way. The 2.75 was matched
-        //     by eye against the perspective path so ortho and perspective UI
-        //     sit at the same depth at the same slider value.
-        float ndcOffset = hudOffset * (isOrthographic ? StereoHudOrthoScale : ReferenceProjectionScale);
+        // dynamic3d 5.2: a layer at a fixed multiple of the convergence
+        // distance shifts by separation * (1/factor - 1) - proportional to
+        // separation, independent of convergence - so this is that mapping with
+        // the factor running from infinity (0) through 1 (50) to 1/2 (100).
+        // Scaling by separation also makes the HUD go properly flat at zero
+        // separation.
+        //
+        // This replaces 0.04 * 2.75 * separation / 0.02 at full travel - 5.5x
+        // the separation - which passed infinity a few points below 50 and was
+        // stopped by the clamp below around 40, while above 60 it popped out
+        // further than the background sits behind. Only the middle fifth of the
+        // slider was usable; now all of it is, at a fifth of the step size.
+        //
+        // Negated so slider > 50 produces pop-out (negative parallax) and
+        // slider < 50 produces push-back (positive parallax).
+        const float hudOffset = -centered * stereoSeparationFraction(separationSlider);
+        const float ndcOffset = hudOffset;
 
         // dynamic3d 6.1 - pop-out is not divergence, so the two directions do
         // not get the same limit. Behind the screen plane the constraint is
@@ -269,10 +259,6 @@ namespace RT64 {
         // the screen plane the element is on.
         const float ndcLimit = (hudOffset > 0.0f) ? StereoBehindNdcLimit : StereoPopOutNdcLimit;
         return std::max(-ndcLimit, std::min(ndcLimit, ndcOffset));
-    }
-
-    float stereoHudOrthoNdcOffset(uint32_t hudDepthSlider, uint32_t separationSlider) {
-        return stereoHudNdcOffset(hudDepthSlider, separationSlider, true);
     }
 
     // Apply a constant per-eye horizontal shift to a HUD/UI projection matrix so
@@ -296,17 +282,57 @@ namespace RT64 {
     //   - Orthographic: there is no perspective divide, so we add a direct NDC
     //     shift via m[3][0], with the sign flipped so the slider pushes both
     //     projection types the same way.
-    static void applyStereoHudShift(interop::float4x4 &projMatrix, StereoEye eye, uint32_t hudDepthSlider,
-                                    uint32_t separationSlider, bool isOrthographic) {
+    float stereoSnapNdcToPixel(float ndcOffset, float halfViewportWidth, float gridPixels) {
+        if ((halfViewportWidth < 1.0f) || (gridPixels <= 0.0f)) {
+            return ndcOffset;
+        }
+
+        // One output pixel is 1 / halfViewportWidth of NDC; one grid step is
+        // gridPixels of them. Symmetric rounding, so the two eyes' opposite
+        // shifts stay exactly opposite.
+        const float ndcPerStep = gridPixels / halfViewportWidth;
+        return std::round(ndcOffset / ndcPerStep) * ndcPerStep;
+    }
+
+    // Half the output width in pixels of the viewport a framebuffer pair is
+    // drawn into: the colour image width times the pair's resolution scale,
+    // derived as the workload queue does for the pair (including halving it
+    // for the much taller hi-res targets) and as the framebuffer renderer then
+    // sizes its viewport.
+    // Also returns, in *nativePixel, the pair's resolution scale - the width in
+    // output pixels of one native pixel, the block RasterPS snaps 2D texture
+    // coordinates to (see stereoSnapNdcToPixel).
+    static float stereoHalfViewportPixels(const Workload &workload, const FramebufferPair &fbPair, hlslpp::float2 resolutionScale,
+                                          float *nativePixel) {
+        const uint32_t nativeWidth = fbPair.colorImage.width;
+        *nativePixel = 0.0f;
+        if (nativeWidth == 0) {
+            return 0.0f;
+        }
+
+        hlslpp::float2 scale = resolutionScale;
+        const uint32_t heightThreshold = (workload.viFbSize[1] > 0) ? ((workload.viFbSize[1] * 3) / 2) : 360;
+        if ((uint32_t(fbPair.drawColorRect.bottom(true)) >= heightThreshold) && (float(scale[1]) >= 2.0f)) {
+            scale = hlslpp::max(scale / 2.0f, hlslpp::float2(1.0f, 1.0f));
+        }
+
+        scale = RenderTarget::computeFixedResolutionScale(nativeWidth, scale);
+        // RasterPS uses resolutionScale.yy for its blocks in both axes.
+        *nativePixel = float(scale[1]);
+        return float(nativeWidth) * float(scale[0]) * 0.5f;
+    }
+
+    // ndcOffset is stereoHudNdcOffset, already rounded to the pixel grid.
+    static void applyStereoHudShift(interop::float4x4 &projMatrix, StereoEye eye, float ndcOffset, bool isOrthographic) {
         if (eye == StereoEye::None) {
             return;
         }
         const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
         if (isOrthographic) {
-            projMatrix[3][0] -= eyeSign * stereoHudOrthoNdcOffset(hudDepthSlider, separationSlider);
+            projMatrix[3][0] -= eyeSign * ndcOffset;
         }
         else {
-            projMatrix[2][0] += eyeSign * stereoHudNdcOffset(hudDepthSlider, separationSlider, false);
+            projMatrix[2][0] += eyeSign * ndcOffset;
         }
     }
 
@@ -404,6 +430,7 @@ namespace RT64 {
         debugViewShiftCount = 0;
         debugOtherIdCount = 0;
         debugLastOtherId = 0;
+        debugHudCameraCount = 0;
         debugLastConvergence = 0.0f;
 
         for (size_t s = 0; s < p.curFrame->perspectiveScenes.size(); s++) {
@@ -417,8 +444,8 @@ namespace RT64 {
         if (p.stereoEye == StereoEye::Left) {
             static uint32_t convergenceLogCounter = 0;
             if ((convergenceLogCounter++ % 30) == 0) {
-                fprintf(stdout, "RT64CONV persp=%u viewshift=%u otherIds=%u lastOtherId=%08X conv=%.2f slider=%u auto=%.2f primaryCalls=%u\n",
-                    debugPerspectiveCount, debugViewShiftCount, debugOtherIdCount, debugLastOtherId, debugLastConvergence,
+                fprintf(stdout, "RT64CONV persp=%u viewshift=%u hudcams=%u otherIds=%u lastOtherId=%08X conv=%.2f slider=%u auto=%.2f primaryCalls=%u\n",
+                    debugPerspectiveCount, debugViewShiftCount, debugHudCameraCount, debugOtherIdCount, debugLastOtherId, debugLastConvergence,
                     p.stereoConvergence, p.stereoConvergenceAuto,
                     (primaryWorld != nullptr) ? primaryWorld->gameCallCount : 0u);
                 fflush(stdout);
@@ -492,6 +519,35 @@ namespace RT64 {
 
             // See process(): picked by draw count, not by processing order.
             const bool isPrimaryWorld = (&proj == primaryWorld);
+
+            // An untagged perspective that is really a HUD item's private camera
+            // (see viewMatrixLooksLikeHudCamera) takes the HUD treatment instead
+            // of the world's. Judged on the game's own view, before any stereo.
+            const bool isHudCamera = (proj.type == Projection::Type::Perspective) && !isPrimaryWorld &&
+                isStereoViewShiftProjectionId(curProjGroup.matrixId) &&
+                viewMatrixLooksLikeHudCamera(drawData.viewTransforms[proj.transformsIndex]);
+            const bool getsWorldShear = (proj.type == Projection::Type::Perspective) &&
+                isStereoProjectionId(curProjGroup.matrixId) && !isHudCamera;
+            const bool isOrthoProjection = (proj.type == Projection::Type::Orthographic);
+            if (isHudCamera) {
+                debugHudCameraCount++;
+            }
+            // Every orthographic projection is 2D content - the logo tiles,
+            // menus and HUD panels - whatever its ID. The world-ID test only
+            // means something for perspectives: Goemon tags nothing, so the
+            // untagged ID has to count as world for its camera to get stereo,
+            // and gating orthographic HUD on "not a world ID" left every
+            // untagged orthographic draw flat on the screen plane instead of
+            // at the HUD depth.
+            const bool isHudProjection = isHudCamera || isOrthoProjection ||
+                ((proj.type == Projection::Type::Perspective) && isStereoHudProjectionId(curProjGroup.matrixId));
+            // On whole native pixels of this pair's viewport, the grid the rect
+            // path rounds to as well - see stereoSnapNdcToPixel.
+            float hudNativePixel = 0.0f;
+            const float hudHalfViewport = isHudProjection ? stereoHalfViewportPixels(workload, fbPair, p.resolutionScale, &hudNativePixel) : 0.0f;
+            const float hudNdcOffset = isHudProjection
+                ? stereoSnapNdcToPixel(stereoHudNdcOffset(p.stereoHudDepth, p.stereoSeparation), hudHalfViewport, hudNativePixel)
+                : 0.0f;
             if (proj.type == Projection::Type::Perspective) {
                 debugPerspectiveCount++;
                 if (!isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
@@ -502,9 +558,7 @@ namespace RT64 {
 
             // Apply stereoscopic off-axis projection offset for world (gameplay)
             // and skybox projections.
-            if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
-                (proj.type == Projection::Type::Perspective) &&
-                isStereoProjectionId(curProjGroup.matrixId)) {
+            if ((p.stereoMode != UserConfiguration::StereoMode::Off) && getsWorldShear) {
                 applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation);
 
                 // Publish this projection's depth terms for the depth sampler.
@@ -547,15 +601,10 @@ namespace RT64 {
             // Untagged perspective projections (FMV / cutscene playback) are left
             // alone so they don't flicker as the per-eye shifts go in opposite
             // directions.
-            {
-                const bool isOrtho = (proj.type == Projection::Type::Orthographic);
-                const bool isHudProjection = (!isStereoProjectionId(curProjGroup.matrixId)) &&
-                    (isOrtho || isStereoHudProjectionId(curProjGroup.matrixId));
-                if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
-                    isHudProjection &&
-                    (p.stereoHudDepth != 50)) {
-                    applyStereoHudShift(projMatrix, p.stereoEye, p.stereoHudDepth, p.stereoSeparation, isOrtho);
-                }
+            if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
+                isHudProjection &&
+                (p.stereoHudDepth != 50)) {
+                applyStereoHudShift(projMatrix, p.stereoEye, hudNdcOffset, isOrthoProjection);
             }
 
             interop::float4x4 &prevViewTransform = drawData.prevViewTransforms[proj.transformsIndex];
@@ -570,20 +619,13 @@ namespace RT64 {
                 // produces a partially-shifted matrix that jitters every frame
                 // because interpolation weights vary across the interpolated
                 // frames the workload emits.
-                if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
-                    (proj.type == Projection::Type::Perspective) &&
-                    isStereoProjectionId(curProjGroup.matrixId)) {
+                if ((p.stereoMode != UserConfiguration::StereoMode::Off) && getsWorldShear) {
                     applyStereoOffAxis(adjustedPrevProj, p.stereoEye, p.stereoSeparation);
                 }
-                {
-                    const bool isOrtho = (proj.type == Projection::Type::Orthographic);
-                    const bool isHudProjection = (!isStereoProjectionId(curProjGroup.matrixId)) &&
-                        (isOrtho || isStereoHudProjectionId(curProjGroup.matrixId));
-                    if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
-                        isHudProjection &&
-                        (p.stereoHudDepth != 50)) {
-                        applyStereoHudShift(adjustedPrevProj, p.stereoEye, p.stereoHudDepth, p.stereoSeparation, isOrtho);
-                    }
+                if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
+                    isHudProjection &&
+                    (p.stereoHudDepth != 50)) {
+                    applyStereoHudShift(adjustedPrevProj, p.stereoEye, hudNdcOffset, isOrthoProjection);
                 }
                 viewMatrix = rigidBody->lerp(p.curFrameWeight, *prevViewMatrix, curViewTransform, true);
                 prevViewTransform = rigidBody->lerp(p.prevFrameWeight, *prevViewMatrix, curViewTransform, true);
@@ -607,18 +649,12 @@ namespace RT64 {
             // Apply the matching lateral view-space shift for stereo. Done after
             // the lerp so both interpolation endpoints carry the same shift. Both
             // the current and previous view matrices must shift the same way so
-            // motion vectors / prev-viewProj stay correct.
-            //
-            // NOTE on the skybox: in a typical N64 game the skybox renders with
-            // the camera at the origin and gets only the projection off-axis,
-            // which puts it at infinity. Goemon's skybox doesn't seem to follow
-            // that pattern — the viewMatrixLooksLikeSkybox heuristic doesn't
-            // fire — so leaving the view shift on here for now. Revisit once
-            // we know whether Goemon's sky is its own perspective scene or
-            // distant geometry inside the gameplay perspective.
+            // motion vectors / prev-viewProj stay correct. Goemon's yaw-following
+            // sky is its own skybox-tagged projection (patches/background.c), so
+            // it gets the shear alone and sits at infinity.
             if ((p.stereoMode != UserConfiguration::StereoMode::Off) &&
                 (proj.type == Projection::Type::Perspective) &&
-                isStereoViewShiftProjectionId(curProjGroup.matrixId)) {
+                isStereoViewShiftProjectionId(curProjGroup.matrixId) && !isHudCamera) {
                 // m[0][0] is the post-widescreen-adjust horizontal projection
                 // scale for this same transform index, and the shear above left
                 // it untouched, so it is still the live tan(half FoV) reciprocal

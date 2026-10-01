@@ -1799,9 +1799,12 @@ namespace RT64 {
                                 triangles.screenOffset.x += p.stereoSkyboxRectOffsetX;
                             }
                             else {
+                                // HUD rects on whole native pixels, so text
+                                // samples its texels identically in both eyes
+                                // (see stereoSnapNdcToPixel).
                                 triangles.screenOffset.x += call.callDesc.extendedFlags.skyboxRect
                                     ? p.stereoSkyboxRectOffsetX
-                                    : p.stereoRectOffsetX;
+                                    : stereoSnapNdcToPixel(p.stereoRectOffsetX, halfViewportSize.x, float(p.resolutionScale.y));
                             }
 
                             if (p.postBlendNoise) {

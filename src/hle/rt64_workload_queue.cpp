@@ -375,6 +375,7 @@ namespace RT64 {
             projParams.curFrameWeight = curFrameWeight;
             projParams.prevFrameWeight = prevFrameWeight;
             projParams.aspectRatioScale = workloadConfig.aspectRatioScale;
+            projParams.resolutionScale = workloadConfig.resolutionScale;
             projParams.stereoMode = stereoMode;
             projParams.stereoSeparation = ext.sharedResources->userConfig.stereoSeparation;
             projParams.stereoConvergence = ext.sharedResources->userConfig.stereoConvergence;
@@ -742,7 +743,7 @@ namespace RT64 {
                         // else.
                         if (stereoCfg.stereoHudDepth != 50) {
                             drawParams.stereoRectOffsetX =
-                                -eyeSign * stereoHudOrthoNdcOffset(stereoCfg.stereoHudDepth, stereoCfg.stereoSeparation);
+                                -eyeSign * stereoHudNdcOffset(stereoCfg.stereoHudDepth, stereoCfg.stereoSeparation);
                         }
 
                         // Skybox rect parallax, under clip space (dynamic3d

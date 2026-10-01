@@ -27,22 +27,11 @@ namespace RT64 {
     //
     //   StereoSeparationPerSlider    - 0..50 slider -> 0..0.10 of screen width
     //                                  of background disparity.
-    //   StereoHudReferenceSeparation - the separation the HUD offsets below
-    //                                  were tuned at (the shipped default), so
-    //                                  HUD depth scales with the depth knob and
-    //                                  goes flat when separation is 0.
-    //   StereoHudMaxOffset           - NDC offset at the ends of the HUD slider.
-    //   StereoHudOrthoScale          - matches an orthographic HUD element's
-    //                                  visible depth to a perspective one at
-    //                                  the same slider value.
     //   StereoBehindNdcLimit /
     //   StereoPopOutNdcLimit         - dynamic3d 6.1: pop-out is not
     //                                  divergence, so the two directions get
     //                                  different clamps.
     static constexpr float StereoSeparationPerSlider = 0.10f / 50.0f;
-    static constexpr float StereoHudReferenceSeparation = 10.0f * StereoSeparationPerSlider;
-    static constexpr float StereoHudMaxOffset = 0.04f;
-    static constexpr float StereoHudOrthoScale = 2.75f;
     static constexpr float StereoBehindNdcLimit = 0.10f;   // ~5% of eye width
     static constexpr float StereoPopOutNdcLimit = 0.30f;   // ~15% of eye width
 
@@ -60,11 +49,35 @@ namespace RT64 {
     // fraction of screen width.
     float stereoSeparationFraction(uint32_t separationSlider);
 
-    // The per-eye NDC x offset an ORTHOGRAPHIC HUD element gets for a given HUD
-    // depth, before the eye sign is applied. Sign convention matches
+    // The per-eye NDC x offset every HUD element gets for a given HUD depth,
+    // before the eye sign is applied: -(hud - 50) / 50 * separation, so 0 is
+    // the depth of infinity, 50 the screen plane and 100 the mirror of
+    // infinity in front of it. Sign convention matches
     // applyStereoHudShift's orthographic branch: the caller subtracts
     // eyeSign * this from the element's NDC x.
-    float stereoHudOrthoNdcOffset(uint32_t hudDepthSlider, uint32_t separationSlider);
+    float stereoHudNdcOffset(uint32_t hudDepthSlider, uint32_t separationSlider);
+
+    // Rounds a per-eye NDC shift to a whole number of NATIVE pixels - multiples
+    // of gridPixels output pixels (the resolution scale), given half the
+    // viewport's width in output pixels.
+    //
+    // Goemon draws its text as point-sampled texture rectangles and
+    // orthographic quads, so where a glyph lands against the pixel grid decides
+    // which source texel each output pixel takes: two eyes shifted by equal and
+    // opposite fractions of a pixel sample different texels, and the font comes
+    // out a slightly different weight in each eye, which cannot be fused. The
+    // Dino3D branch fixed that by rounding to whole OUTPUT pixels.
+    //
+    // That is not enough here. With 2D upscaling off, RasterPS emulates native
+    // resolution by snapping texture coordinates to native-pixel blocks anchored
+    // at absolute screen position (lowResUV -= fmod(screenPos, resolutionScale)
+    // * dUV). A shift that is a whole number of output pixels but not of native
+    // ones moves a glyph against those blocks, so each eye crosses them at a
+    // different point - and at a rect's edge one eye gets a partial block that
+    // samples the texel past the glyph, seen as a 1-pixel white line down the
+    // edge of the text in that eye only. Whole native pixels keep both eyes on
+    // the same block phase, at the cost of the HUD moving in native-pixel steps.
+    float stereoSnapNdcToPixel(float ndcOffset, float halfViewportWidth, float gridPixels);
 
     enum class StereoEye {
         None,
@@ -84,6 +97,11 @@ namespace RT64 {
             float curFrameWeight = 1.0f;
             float prevFrameWeight = 0.0f;
             float aspectRatioScale = 1.0f;
+            // The workload's base resolution scale, from which each framebuffer
+            // pair's output pixel width is derived exactly as the framebuffer
+            // renderer derives it - so HUD shifts baked into projections can be
+            // rounded to the same pixel grid as the ones it applies to rects.
+            hlslpp::float2 resolutionScale = { 1.0f, 1.0f };
             // Stereoscopic 3D parameters. When stereoMode == Off (default), no per-eye
             // adjustment is performed and behavior matches the original mono pipeline.
             UserConfiguration::StereoMode stereoMode = UserConfiguration::StereoMode::Off;
