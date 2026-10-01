@@ -155,8 +155,17 @@ namespace RT64 {
         }
 
         void popMatrixGroupV1(State *state, DisplayList **dl) {
+            // Both fields are in w1: gEXPopMatrixGroup(N) encodes its single
+            // parameter word as PARAM(count, 8, 0) | PARAM(proj, 1, 8). This
+            // read the projection flag from bit 8 of w0 - the opcode word, where
+            // that bit is always 0 (G_EX_POPMATRIXGROUP_V1 is 0x0D) - so every
+            // pop popped the MODELVIEW group stack. A projection group pushed
+            // with G_EX_PUSH therefore never came off: everything drawn after it
+            // kept its ID, and the modelview stack lost a group it should have
+            // kept. Nothing had hit it because projection groups were only ever
+            // set with G_EX_NOPUSH.
             const uint8_t popCount = (*dl)->p1(0, 8);
-            const uint8_t proj = (*dl)->p0(8, 1);
+            const uint8_t proj = (*dl)->p1(8, 1);
             state->rsp->popMatrixId(popCount, proj);
         }
 
