@@ -10,6 +10,22 @@
 #include "rt64_vi_renderer.h"
 
 namespace RT64 {
+    void stereoEyeVisibleSpanX(float contentWidth, float contentHeight,
+                               float &outOriginX, float &outWidth) {
+        outOriginX = 0.0f;
+        outWidth = contentWidth;
+        if ((contentWidth <= 0.0f) || (contentHeight <= 0.0f)) {
+            return;
+        }
+
+        constexpr float kTargetEyeAspect = 16.0f / 9.0f;
+        const float contentAspect = contentWidth / contentHeight;
+        if (contentAspect > (kTargetEyeAspect + 1e-4f)) {
+            outWidth = contentWidth * (kTargetEyeAspect / contentAspect);
+            outOriginX = (contentWidth - outWidth) * 0.5f;
+        }
+    }
+
     StereoRenderer::StereoRenderer() { }
 
     StereoRenderer::~StereoRenderer() { }
@@ -89,12 +105,15 @@ namespace RT64 {
             // slice so the glasses see correctly-proportioned content instead
             // of a horizontally squashed view. On 16:9 displays texAspect is
             // ~16:9 and this is a no-op.
-            const float texAspect = (texH > 0.0f) ? (texW / texH) : 1.0f;
-            constexpr float kTargetEyeAspect = 16.0f / 9.0f;
-            if (texAspect > kTargetEyeAspect + 1e-4f) {
-                const float contentFractionX = kTargetEyeAspect / texAspect;
-                pushConstants.videoResolution = { texW * contentFractionX, texH };
-                pushConstants.contentOrigin = { (1.0f - contentFractionX) * 0.5f, 0.0f };
+            // stereoEyeVisibleSpanX owns the rule; the depth sampler derives
+            // its region of interest from the same function so the two cannot
+            // drift. The origin is in normalized TEXTURE uv, hence the divide.
+            float visibleOriginX = 0.0f;
+            float visibleW = texW;
+            stereoEyeVisibleSpanX(texW, texH, visibleOriginX, visibleW);
+            if (visibleW < texW) {
+                pushConstants.videoResolution = { visibleW, texH };
+                pushConstants.contentOrigin = { visibleOriginX / texW, 0.0f };
             }
         } else {
             pushConstants.videoResolution = (hlslpp::float2(p.vi->fbSize()) * p.resolutionScale) / float(p.downsamplingScale);

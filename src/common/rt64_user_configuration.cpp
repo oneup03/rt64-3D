@@ -101,6 +101,9 @@ namespace RT64 {
         stereoHudDepth = 35;
         stereoGhostContrast = 100;
         stereoGhostBlackFloor = 0;
+        stereoAutoConvergence = 0;
+        stereoConvergenceManual = 200;
+        stereoComfortTarget = 0;
     }
 
     void UserConfiguration::validate() {
@@ -118,6 +121,9 @@ namespace RT64 {
         clampEnum<StereoMode>(stereoMode);
         stereoSeparation = std::clamp<uint32_t>(stereoSeparation, 0, 50);
         stereoConvergence = std::clamp<uint32_t>(stereoConvergence, 1, 500);
+        stereoAutoConvergence = (stereoAutoConvergence != 0) ? 1 : 0;
+        stereoConvergenceManual = std::clamp<uint32_t>(stereoConvergenceManual, 1, 500);
+        stereoComfortTarget = std::clamp<int32_t>(stereoComfortTarget, -50, 60);
         stereoHudDepth = std::clamp<uint32_t>(stereoHudDepth, 0, 100);
         stereoGhostContrast = std::clamp<uint32_t>(stereoGhostContrast, 0, 100);
         stereoGhostBlackFloor = std::clamp<uint32_t>(stereoGhostBlackFloor, 0, 100);

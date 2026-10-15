@@ -135,6 +135,20 @@ namespace RT64 {
         // math entirely when they're both there.
         uint32_t stereoGhostContrast;
         uint32_t stereoGhostBlackFloor;
+        // The depth-driven convergence loop's inputs, pushed by the host each
+        // frame rather than serialised (the saved state lives in the game's
+        // own config). Non-zero while the user's Auto Convergence toggle is
+        // on; gates the loop in the workload queue.
+        uint32_t stereoAutoConvergence;
+        // The user's convergence slider as configured (tenths, like
+        // stereoConvergence), before the depth loop pulls it in. The loop's
+        // CEILING: it only ever moves the screen plane closer, never further.
+        uint32_t stereoConvergenceManual;
+        // Comfort budget for the loop, in thousandths of screen width of
+        // permitted pop-out. SIGNED: 0 puts the screen plane exactly on the
+        // nearest object, and negative values pull it in FRONT of the nearest
+        // object so the whole scene sits behind the screen.
+        int32_t stereoComfortTarget;
 
         UserConfiguration();
         void validate();

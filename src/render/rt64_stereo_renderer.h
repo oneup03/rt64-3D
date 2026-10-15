@@ -11,6 +11,22 @@
 #include "rt64_shader_library.h"
 
 namespace RT64 {
+    // The horizontal slice of a rendered eye that the stereo compose actually
+    // SHOWS, in the same units as the content passed in.
+    //
+    // When a rendered eye is wider than 16:9 the compose crops it to its centred
+    // 16:9 slice - the ultrawide / 32:9 case, where full-SbS glasses split the
+    // panel into two 16:9 halves. Everything outside that slice is rendered and
+    // then discarded.
+    //
+    // Shared rather than reimplemented, because anything that has to agree with
+    // what the viewer actually sees derives from it: the auto-convergence depth
+    // sampler, whose region of interest would otherwise span the discarded
+    // margins and let off-screen geometry drive convergence. A second copy of
+    // the rule is a second thing to keep in step.
+    void stereoEyeVisibleSpanX(float contentWidth, float contentHeight,
+                               float &outOriginX, float &outWidth);
+
     // Mirrors VIRenderer but binds two eye textures and the stereoCompose
     // pipeline so the final present packs the image into Side-by-Side,
     // Top-and-Bottom, or Row-Interlaced output. Reuses VIRenderer's viewport

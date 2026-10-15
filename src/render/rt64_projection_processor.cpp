@@ -5,11 +5,53 @@
 #include "rt64_projection_processor.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 
 #include "common/rt64_math.h"
 #include "hle/rt64_workload_queue.h"
 
 namespace RT64 {
+    // The world projection's two depth terms and its viewport's depth scale
+    // and translate, published from the render thread and read by the depth
+    // sampler (rt64_stereo_depth_sampler) a frame later. Stored as raw bits so
+    // they can be atomics without a lock.
+    static std::atomic<uint32_t> worldDepthM22Bits{0};
+    static std::atomic<uint32_t> worldDepthM32Bits{0};
+    static std::atomic<uint32_t> worldDepthVpScaleZBits{0};
+    static std::atomic<uint32_t> worldDepthVpTranslateZBits{0};
+    static std::atomic<bool> worldDepthTermsValid{false};
+
+    static uint32_t floatToBits(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
+    static float bitsToFloat(uint32_t bits) {
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    void stereoPublishWorldDepthTerms(float m22, float m32, float vpScaleZ, float vpTranslateZ) {
+        worldDepthM22Bits.store(floatToBits(m22), std::memory_order_relaxed);
+        worldDepthM32Bits.store(floatToBits(m32), std::memory_order_relaxed);
+        worldDepthVpScaleZBits.store(floatToBits(vpScaleZ), std::memory_order_relaxed);
+        worldDepthVpTranslateZBits.store(floatToBits(vpTranslateZ), std::memory_order_relaxed);
+        worldDepthTermsValid.store(true, std::memory_order_relaxed);
+    }
+
+    bool stereoGetWorldDepthTerms(float &m22, float &m32, float &vpScaleZ, float &vpTranslateZ) {
+        if (!worldDepthTermsValid.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        m22 = bitsToFloat(worldDepthM22Bits.load(std::memory_order_relaxed));
+        m32 = bitsToFloat(worldDepthM32Bits.load(std::memory_order_relaxed));
+        vpScaleZ = bitsToFloat(worldDepthVpScaleZBits.load(std::memory_order_relaxed));
+        vpTranslateZ = bitsToFloat(worldDepthVpTranslateZBits.load(std::memory_order_relaxed));
+        return true;
+    }
     inline void adjustProjectionMatrix(interop::float4x4 &matrix, const float aspectRatioScale) {
         matrix[0][0] *= aspectRatioScale;
         matrix[1][0] *= aspectRatioScale;
@@ -112,12 +154,29 @@ namespace RT64 {
         return static_cast<float>(separationSlider) * SeparationPerSlider;
     }
 
+    float stereoSeparationFraction(uint32_t separationSlider) {
+        return stereoSeparation(separationSlider);
+    }
+
     // Convergence stays what it always was: the distance at which geometry sits
     // exactly on the screen plane. It arrives in tenths of a slider unit
     // (1..500 = 0.1..50), so the game-unit conversion is 2 per tenth: the
     // 0.1..50 slider spans 2..1000 game units.
     static float stereoConvergenceWorld(uint32_t convergenceTenths) {
         return static_cast<float>(convergenceTenths) * 2.0f;
+    }
+
+    float stereoConvergenceWorldUnits(uint32_t convergenceTenths) {
+        return stereoConvergenceWorld(convergenceTenths);
+    }
+
+    // The convergence actually applied, in game units: the slider, or the
+    // depth loop's pull-in when it has one (ProcessParams::stereoConvergenceAuto).
+    // The loop's value is already bounded by the slider, but take the min here
+    // too so the screen plane never goes further than the user asked for.
+    static float stereoEffectiveConvergence(uint32_t convergenceTenths, float convergenceAuto) {
+        const float manual = stereoConvergenceWorld(convergenceTenths);
+        return (convergenceAuto > 0.0f) ? std::min(convergenceAuto, manual) : manual;
     }
 
     // BK's horizontal projection scale at the aspect ratio the HUD constants
@@ -237,7 +296,7 @@ namespace RT64 {
     // while background disparity stays fixed at `separation`. Anything that
     // wants a physical eye offset has to read it from here rather than assuming
     // the separation slider is one.
-    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider, uint32_t convergenceTenths, float projectionScale) {
+    static void applyStereoViewShift(interop::float4x4 &viewMatrix, StereoEye eye, uint32_t separationSlider, float convergenceWorld, float projectionScale) {
         if (eye == StereoEye::None) {
             return;
         }
@@ -248,7 +307,7 @@ namespace RT64 {
             return;
         }
         const float tanHalfHorFov = 1.0f / projectionScale;
-        const float halfBaseline = stereoSeparation(separationSlider) * tanHalfHorFov * stereoConvergenceWorld(convergenceTenths);
+        const float halfBaseline = stereoSeparation(separationSlider) * tanHalfHorFov * convergenceWorld;
         const float eyeSign = (eye == StereoEye::Left) ? +1.0f : -1.0f;
         // For a row-vector view matrix, m[3][0] is the X translation in view
         // space. Adding to it shifts world points right in view space, which is
@@ -270,6 +329,33 @@ namespace RT64 {
     }
 
     void ProjectionProcessor::process(const ProcessParams &p) {
+        // The frame's main world projection, whose depth terms the depth
+        // sampler inverts: of the full-width world perspectives, the one with
+        // the most draw calls. Scenes are not processed in draw order, and BK
+        // re-emits its world projection (after the HUD block, Bottles' bonus),
+        // so neither the first nor the last one seen is reliably the world's.
+        primaryWorld = nullptr;
+        uint32_t primaryWorldCalls = 0;
+        for (const GameScene &scene : p.curFrame->perspectiveScenes) {
+            for (const GameIndices::Projection &sceneProj : scene.projections) {
+                const Workload &workload = p.workloadQueue->workloads[sceneProj.workloadIndex];
+                const FramebufferPair &fbPair = workload.fbPairs[sceneProj.fbPairIndex];
+                const Projection &proj = fbPair.projections[sceneProj.projectionIndex];
+                if ((proj.type != Projection::Type::Perspective) || proj.scissorRect.isNull()) {
+                    continue;
+                }
+
+                const uint32_t groupIndex = workload.drawData.viewProjTransformGroups[proj.transformsIndex];
+                const uint32_t matrixId = workload.drawData.transformGroups[groupIndex].matrixId;
+                const bool spansFullWidth = (proj.scissorRect.ulx <= fbPair.scissorRect.ulx) &&
+                    (proj.scissorRect.lrx >= fbPair.scissorRect.lrx);
+                if (spansFullWidth && isStereoViewShiftProjectionId(matrixId) && (proj.gameCallCount > primaryWorldCalls)) {
+                    primaryWorld = &proj;
+                    primaryWorldCalls = proj.gameCallCount;
+                }
+            }
+        }
+
         for (uint32_t w : p.curFrame->workloads) {
             Workload &workload = p.workloadQueue->workloads[w];
             DrawData &drawData = workload.drawData;
@@ -362,6 +448,25 @@ namespace RT64 {
                 (proj.type == Projection::Type::Perspective) &&
                 isStereoProjectionId(curProjGroup.matrixId)) {
                 applyStereoOffAxis(projMatrix, p.stereoEye, p.stereoSeparation);
+
+                // Publish the main world projection's depth terms for the depth
+                // sampler: the sampled depth buffer was rendered with it, so
+                // these invert it. The shear only touches column 0, so [2][2]
+                // and [3][2] are the game's own. The sky (0x1001) has its own
+                // near and far and is never the primary world.
+                if (&proj == primaryWorld) {
+                    // The viewport's depth scale and translate are the second
+                    // layer between ndc.z and the stored depth: see
+                    // stereoDeviceDepthToViewZ for why assuming 0.5 is wrong.
+                    float vpScaleZ = 0.0f;
+                    float vpTranslateZ = 0.0f;
+                    if (proj.usesViewport()) {
+                        const interop::RSPViewport &depthViewport = drawData.rspViewports[proj.transformsIndex];
+                        vpScaleZ = depthViewport.scale[2];
+                        vpTranslateZ = depthViewport.translate[2];
+                    }
+                    stereoPublishWorldDepthTerms(projMatrix[2][2], projMatrix[3][2], vpScaleZ, vpTranslateZ);
+                }
             }
 
             // Apply HUD depth shift to HUD/dialog/cutscene-overlay projections so
@@ -450,8 +555,9 @@ namespace RT64 {
                 // it untouched, so it is still the live tan(half FoV) reciprocal
                 // the derived eye baseline needs.
                 const float projectionScale = projMatrix[0][0];
-                applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, p.stereoConvergence, projectionScale);
-                applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, p.stereoConvergence, projectionScale);
+                const float convergenceWorld = stereoEffectiveConvergence(p.stereoConvergence, p.stereoConvergenceAuto);
+                applyStereoViewShift(viewMatrix, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
+                applyStereoViewShift(prevViewTransform, p.stereoEye, p.stereoSeparation, convergenceWorld, projectionScale);
             }
 
             viewProjMatrix = hlslpp::mul(viewMatrix, projMatrix);

@@ -7,10 +7,38 @@
 #include "common/rt64_thread.h"
 
 #include "rt64_present_queue.h"
+#include "render/rt64_projection_processor.h"
+#include "render/rt64_stereo_depth_sampler.h"
+#include "render/rt64_stereo_renderer.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
 
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
 
 namespace RT64 {
+    // The depth-driven convergence loop's latest answer, in game units (0: none),
+    // stored on the render thread after the left eye's world pass and read by
+    // the next frame's projection setup. Raw bits so it can be an atomic.
+    static std::atomic<uint32_t> stereoAutoConvergenceBits{0};
+
+    static void stereoStoreAutoConvergence(float convergence) {
+        uint32_t bits = 0;
+        if (convergence > 0.0f) {
+            std::memcpy(&bits, &convergence, sizeof(bits));
+        }
+        stereoAutoConvergenceBits.store(bits, std::memory_order_relaxed);
+    }
+
+    static float stereoLoadAutoConvergence() {
+        const uint32_t bits = stereoAutoConvergenceBits.load(std::memory_order_relaxed);
+        float convergence = 0.0f;
+        std::memcpy(&convergence, &bits, sizeof(convergence));
+        return convergence;
+    }
+
     // WorkloadQueue
 
     WorkloadQueue::WorkloadQueue() {
@@ -139,6 +167,18 @@ namespace RT64 {
             if ((ext.sharedResources->swapChainWidth > 0) && (ext.sharedResources->swapChainHeight > 0)) {
                 const float derivedRatioTarget = float(ext.sharedResources->swapChainWidth) / float(ext.sharedResources->swapChainHeight);
                 workloadConfig.aspectRatioTarget = std::max(derivedRatioTarget, workloadConfig.aspectRatioSource);
+
+                // In stereo each eye is SHOWN at 16:9 however wide the display
+                // is (the compose crops a wider eye to its centred 16:9 slice:
+                // see stereoEyeVisibleSpanX), so rendering an eye wider than
+                // that is work thrown away. Capping gives the same image for
+                // less, and keeps the depth sampler's grid on what is shown.
+                // Manual keeps an explicit aspect the user picked.
+                if (ext.sharedResources->userConfig.stereoMode != UserConfiguration::StereoMode::Off) {
+                    constexpr float kMaxStereoEyeAspect = 16.0f / 9.0f;
+                    workloadConfig.aspectRatioTarget = std::max(workloadConfig.aspectRatioSource,
+                        std::min(workloadConfig.aspectRatioTarget, kMaxStereoEyeAspect));
+                }
             }
             else {
                 workloadConfig.aspectRatioTarget = workloadConfig.aspectRatioSource;
@@ -320,6 +360,13 @@ namespace RT64 {
             projParams.stereoMode = stereoMode;
             projParams.stereoSeparation = ext.sharedResources->userConfig.stereoSeparation;
             projParams.stereoConvergence = ext.sharedResources->userConfig.stereoConvergence;
+
+            // Depth-driven auto-convergence pulls convergence in when it has
+            // something to say. It never pushes it out: the slider stays the
+            // ceiling (stereoEffectiveConvergence takes the nearer of the two).
+            if (ext.sharedResources->userConfig.stereoAutoConvergence != 0) {
+                projParams.stereoConvergenceAuto = stereoLoadAutoConvergence();
+            }
             projParams.stereoHudDepth = ext.sharedResources->userConfig.stereoHudDepth;
             // Caller selects which eye this pass renders. The two-pass driver in
             // renderThreadLoop runs this function twice with Left then Right when
@@ -739,6 +786,11 @@ namespace RT64 {
             
             // Record all framebuffer pairs.
             uint32_t framebufferIndex = 0;
+            // The depth sampler takes at most one framebuffer pair per pass:
+            // only the world pair carries usable depth, and every extra submit
+            // advances the readback ring so the fetch stops lining up with the
+            // copy.
+            bool stereoDepthSampledThisPass = false;
             for (uint32_t f = 0; f < fbPairCount; f++) {
                 const FramebufferPair &fbPair = workload.fbPairs[f];
                 bool validTargets = getTargetsFromPair(f);
@@ -836,6 +888,89 @@ namespace RT64 {
                     else {
                         RenderTarget *chosenTarget = (colorTarget != nullptr) ? colorTarget : depthTarget;
                         ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(chosenTarget->texture.get(), RenderTextureLayout::SHADER_READ));
+                    }
+
+                    // Depth sampling for the depth-driven auto-convergence loop
+                    // (dynamic3d 4.1). Render-thread only, so no locking.
+                    //
+                    // This loop runs once per framebuffer pair and a frame has
+                    // several. Only the world pass carries usable depth; the
+                    // smaller auxiliary passes are empty there, so sampling
+                    // every pair would produce a stream that is invalid most of
+                    // the time. Require the depth target to be comparable in
+                    // size to the colour target, and let the sampler take only
+                    // the first such pass per frame - reading back only when it
+                    // actually sampled.
+                    {
+                        // Auxiliary passes are much smaller than the world pass;
+                        // half the colour target's dimensions separates them
+                        // without needing an exact match.
+                        //
+                        // Only the left eye is sampled. In stereo the world is
+                        // rendered twice and both passes produce a full-size
+                        // depth target, so taking both would interleave two
+                        // series that differ by the eye disparity - enough to
+                        // make anything driven from this jitter every frame.
+                        //
+                        // Nothing is sampled unless stereo is on AND the loop is
+                        // enabled, so mono play and manual convergence never
+                        // pay for the copy - or touch the readback path at all.
+                        // Turning the loop off snaps it back immediately, so
+                        // re-enabling starts fresh rather than from a stale EMA.
+                        static StereoDepthSampler stereoDepthSampler;
+                        static StereoAutoConvergence stereoAutoConvergence;
+                        const auto &samplerCfg = ext.sharedResources->userConfig;
+                        const bool samplerWanted = (samplerCfg.stereoMode != UserConfiguration::StereoMode::Off) &&
+                            (samplerCfg.stereoAutoConvergence != 0);
+                        if (!samplerWanted) {
+                            stereoAutoConvergence.reset();
+                            stereoStoreAutoConvergence(0.0f);
+                        }
+                        // A COLOUR target is required (from DK64-3D): games emit
+                        // depth-only pairs alongside the world pass, and a null
+                        // colour target used to short-circuit the size test and
+                        // let them through. Their patches are empty, and every
+                        // extra submit also advances the readback ring out of
+                        // step with the copy, hence the once-per-pass guard too.
+                        const bool sampledEye = (stereoEye != StereoEye::Right);
+                        const bool mainPass = samplerWanted && sampledEye && !stereoDepthSampledThisPass &&
+                            (depthTarget != nullptr) && (colorTarget != nullptr) &&
+                            (depthTarget->width * 2 >= colorTarget->width) &&
+                            (depthTarget->height * 2 >= colorTarget->height);
+                        if (mainPass) {
+                            // Hold the sampler to what the compose will actually
+                            // show: a wider-than-16:9 eye is cropped to its
+                            // centred 16:9 slice on the way to the screen.
+                            float visibleOriginX = 0.0f;
+                            float visibleWidth = float(depthTarget->width);
+                            stereoEyeVisibleSpanX(float(depthTarget->width), float(depthTarget->height),
+                                visibleOriginX, visibleWidth);
+                            const bool submitted = stereoDepthSampler.submit(ext.workloadGraphicsWorker, depthTarget,
+                                uint32_t(visibleOriginX), uint32_t(visibleWidth));
+                            stereoDepthSampledThisPass = stereoDepthSampledThisPass || submitted;
+                            if (submitted) {
+                                const StereoDepthSampler::Sample sample = stereoDepthSampler.fetch();
+
+                                // Invert the sampled depth with the projection
+                                // the frame was actually rendered with, rather
+                                // than assuming a nominal near/far.
+                                float projM22 = 0.0f;
+                                float projM32 = 0.0f;
+                                float vpScaleZ = 0.0f;
+                                float vpTranslateZ = 0.0f;
+                                const auto &cfg = ext.sharedResources->userConfig;
+                                if (sample.valid && stereoGetWorldDepthTerms(projM22, projM32, vpScaleZ, vpTranslateZ)) {
+                                    const float nearestZ = stereoDeviceDepthToViewZ(sample.nearestDeviceDepth,
+                                        projM22, projM32, vpScaleZ, vpTranslateZ);
+                                    // Ceiling is the user's UNSCALED slider, so
+                                    // it stays put while the loop works.
+                                    const float applied = stereoAutoConvergence.update(nearestZ,
+                                        stereoConvergenceWorldUnits(cfg.stereoConvergenceManual),
+                                        cfg.stereoSeparation, cfg.stereoComfortTarget);
+                                    stereoStoreAutoConvergence(applied);
+                                }
+                            }
+                        }
                     }
 
                     // Do the resolve if using MSAA while target override is active and we're on the correct framebuffer pair index.
