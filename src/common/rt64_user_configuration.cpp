@@ -110,7 +110,12 @@ namespace RT64 {
         clampEnum<GraphicsAPI>(graphicsAPI);
         clampEnum<Resolution>(resolution);
         clampEnum<DisplayBuffering>(displayBuffering);
-        clampEnum<Antialiasing>(antialiasing);
+        // MSAA is always off in this fork: the right-eye pass renders into an
+        // override target whose redirect is MSAA-gated, so with MSAA on the
+        // right eye never renders, and the auto-convergence depth sampler skips
+        // multisampled targets. Forced here so a stale rt64.json or any caller
+        // cannot turn it back on.
+        antialiasing = Antialiasing::None;
         clampEnum<Filtering>(filtering);
         clampEnum<AspectRatio>(aspectRatio);
         clampEnum<AspectRatio>(extAspectRatio);
